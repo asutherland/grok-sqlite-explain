@@ -25,3 +25,7 @@ but doesn't require it.  It is what shows up after the # in the display, if
 it's there.  The main thing it provides you is reliable information on column/
 index/table names, arguably more reliable than my schema extracted information
 there.
+
+Er, and it outputs to equally hardcoded dot file paths.  You would want to run
+dot against these to generate pretty pictures.  For my purposes, dot was the
+best of the available apps.
