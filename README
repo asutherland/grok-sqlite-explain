@@ -29,3 +29,6 @@ there.
 Er, and it outputs to equally hardcoded dot file paths.  You would want to run
 dot against these to generate pretty pictures.  For my purposes, dot was the
 best of the available apps.
+
+Here's an example of using dot to make a png file:
+$ dot -Tpng -o pretty.png blocks.dot
