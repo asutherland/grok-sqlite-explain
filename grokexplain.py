@@ -136,6 +136,9 @@ class RegStates(object):
         values.add(value)
         return not alreadyPresent
 
+    def setRegValue(self, reg, value):
+        self.regValues[reg] = set([value])
+
     def getRegValues(self, reg):
         if reg in self.regValues:
             return self.regValues[reg]
@@ -557,6 +560,8 @@ class ExplainGrokker(object):
         #  where we would 'come from' to the next opcode.  But we do know that
         #  after us is a basic block break, so let's hint that.
         self.op.dynamicGoTo = params[0]
+        # do not arbitrarily flow to the next dude!
+        self.op.terminate = True
 
     def _op_Return(self, params):
         # just like for Yield, we have no idea where we are going until
@@ -968,13 +973,13 @@ class ExplainGrokker(object):
                         #changes = True
 
                 # stuff for Gosub, Yield, Return
-                if op.dynamicWritePC:
-                    curRegs.addRegValue(op.dynamicWritePC, op.addr)
                 if op.dynamicGoTo:
                     if ensureJumpTargets(op, curRegs.getRegValues(op.dynamicGoTo)):
                         # jump target changes are mutations of the CFG and
                         #  require change processing!
                         changes = True
+                if op.dynamicWritePC:
+                    curRegs.setRegValue(op.dynamicWritePC, op.addr)
 
             if block.outRegs.checkDelta(curRegs):
                 changes = True
