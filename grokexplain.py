@@ -537,13 +537,14 @@ class ExplainGrokker(object):
                 self.op.regReads.append(regs)
         self.op.goTo.append(self.op.addr + 1)
         self.op.goTo.append(target)
+        self.op.usesImmediate = target
 
     def _jump(self, target):
         self.op.goTo.append(target)
+        self.op.usesImmediate = target
 
     def _op_Goto(self, params):
         self._jump(params[1])
-        self.op.usesImmediate = params[1]
 
     def _op_Jump(self, params):
         # we base our decision on the result of the last compare
@@ -551,11 +552,11 @@ class ExplainGrokker(object):
         self._jump(params[0])
         self._jump(params[1])
         self._jump(params[2])
+        self.op.usesImmediate = None # too many for now... XXX
 
     def _op_Gosub(self, params):
         self.op.regWrites.append(params[0])
         self.op.dynamicWritePC = params[0]
-        self.op.usesImmediate = params[1]
         self._jump(params[1])
 
     def _op_Yield(self, params):
@@ -639,7 +640,6 @@ class ExplainGrokker(object):
 
     def _op_VNext(self, params):
         self._getCursor(params[0], False, True)
-        self.op.usesImmediate = params[1]
         self._condJump(None, params[1])
     def _op_Next(self, params):
         self._op_VNext(params)
@@ -650,7 +650,6 @@ class ExplainGrokker(object):
         self._getCursor(params[0], False, True)
         if params[1]:
             self._condJump(None, params[1])
-            self.op.usesImmediate = params[1]
     def _op_Rewind(self, params):
         self._op_Last(params)
     _op_Sort = _op_Rewind
@@ -906,7 +905,10 @@ class ExplainGrokker(object):
                 if isinstance(addr, basestring):
                     continue
                 target_block = self.basicBlocks[addr]
-                g.add_edge(block.id, target_block.id)
+                attrs = {}
+                if target_block.id == block.lastAddr + 1:
+                    attrs['color'] = 'gray'
+                g.add_edge(block.id, target_block.id, **attrs)
 
         g.node_attr['shape'] = 'box'
         g.node_attr['fontsize'] = '8'
