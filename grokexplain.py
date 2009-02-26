@@ -534,7 +534,7 @@ class ExplainGrokker(object):
 
     def _op_Goto(self, params):
         self._jump(params[1])
-        self.usesImmediate = params[1]
+        self.op.usesImmediate = params[1]
 
     def _op_Jump(self, params):
         # we base our decision on the result of the last compare
@@ -546,7 +546,7 @@ class ExplainGrokker(object):
     def _op_Gosub(self, params):
         self.op.regWrites.append(params[0])
         self.op.dynamicWritePC = params[0]
-        self.usesImmediate = params[1]
+        self.op.usesImmediate = params[1]
         self._jump(params[1])
 
     def _op_Yield(self, params):
