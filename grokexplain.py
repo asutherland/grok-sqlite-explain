@@ -209,7 +209,7 @@ class RegStates(object):
     def graphStr(self):
         s = ''
         for reg, values in self.regValues.items():
-            s += 'r%s: %s' % (reg, values)
+            s += ' r%s: %s' % (reg, values)
         return s
 
 class BasicBlock(object):
@@ -309,11 +309,17 @@ class GenericOpInfo(object):
                 unknown.add(realAddr)
         return unknown
 
+    HIGHLIGHT_OPS = {'Yield': '#ff00ff',
+                     'Gosub': '#ff00ff',
+                     'Return': '#ff00ff'}
     def graphStr(self, schemaInfo):
         if self.usesCursor:
             s = "<font color='%s'>%d %s [%d]</font>" % (
                 self.usesCursor.color, self.addr, self.name,
                 self.usesCursor.handle)
+        elif self.name in self.HIGHLIGHT_OPS:
+            s = "%d <font color='%s'>%s</font>" % (
+                self.addr, self.HIGHLIGHT_OPS[self.name], self.name)
         else:
             s = '%d %s' % (self.addr, self.name)
 
@@ -558,17 +564,20 @@ class ExplainGrokker(object):
         self.op.regWrites.append(params[0])
         self.op.dynamicWritePC = params[0]
         self._jump(params[1])
+        if NO_YIELDS:
+            self.op.goTo.append(self.op.addr + 1)
 
     def _op_Yield(self, params):
         self.op.regReads.append(params[0])
         self.op.regWrites.append(params[0])
-        self.op.dynamicWritePC = params[0]
-        # we won't know where out goTo goes to until dataflow analysis, nor
-        #  where we would 'come from' to the next opcode.  But we do know that
-        #  after us is a basic block break, so let's hint that.
-        self.op.dynamicGoTo = params[0]
-        # do not arbitrarily flow to the next dude!
-        self.op.terminate = True
+        if not NO_YIELDS:
+            self.op.dynamicWritePC = params[0]
+            # we won't know where out goTo goes to until dataflow analysis, nor
+            #  where we would 'come from' to the next opcode.  But we do know that
+            #  after us is a basic block break, so let's hint that.
+            self.op.dynamicGoTo = params[0]
+            # do not arbitrarily flow to the next dude!
+            self.op.terminate = True
 
     def _op_Return(self, params):
         # just like for Yield, we have no idea where we are going until
@@ -1062,10 +1071,11 @@ class ExplainGrokker(object):
 
 
 if __name__ == '__main__':
-    global DEBUG
+    global DEBUG, NO_YIELDS
 
     import sys
     DEBUG = 'debug' in sys.argv
+    NO_YIELDS = 'yields' not in sys.argv
 
     sg = SchemaGrokker()
     sf = open('/tmp/schemainfo.txt')
