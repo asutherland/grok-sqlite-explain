@@ -628,6 +628,7 @@ class ExplainGrokker(object):
 
     def _op_VNext(self, params):
         self._getCursor(params[0], False, True)
+        self.op.usesImmediate = params[1]
         self._condJump(None, params[1])
     def _op_Next(self, params):
         self._op_VNext(params)
@@ -638,6 +639,7 @@ class ExplainGrokker(object):
         self._getCursor(params[0], False, True)
         if params[1]:
             self._condJump(None, params[1])
+            self.op.usesImmediate = params[1]
     def _op_Rewind(self, params):
         self._op_Last(params)
     _op_Sort = _op_Rewind
