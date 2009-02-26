@@ -102,40 +102,112 @@ class Cursor(object):
     def __str__(self):
         return 'Cursor %d on %s' % (self.handle, self.on,)
 
-class RegAffectations(object):
+class RegStates(object):
     def __init__(self, copyFrom=None):
-        self.regStates = {}
+        #: maps register number to a set of cursors that have impacted this reg
+        self.regCursorImpacts = {}
+        #: maps register number to a set of values that this register may
+        #:  contain
+        self.regValues = {}
         if copyFrom:
-            for reg, cursors in copyFrom.regStates.items():
-                self.regStates[reg] = cursors.copy()
+            for reg, cursors in copyFrom.regCursorImpacts.items():
+                self.regCursorImpacts[reg] = cursors.copy()
+                print ' copying cursors', reg, cursors
+            for reg, values in copyFrom.regValues.items():
+                print ' copying values', reg, values
+                self.regValues[reg] = values.copy()
 
-    def __setitem__(self, reg, cursors):
-        self.regStates[reg] = cursors.copy()
-
-    def __getitem__(self, reg):
+    def getRegCursorImpacts(self, reg):
         # I think there is defaultdict stuff we could use now...
-        if reg in self.regStates:
-            return self.regStates[reg]
+        if reg in self.regCursorImpacts:
+            return self.regCursorImpacts[reg]
         else:
             return set()
 
+    def setRegCursorImpacts(self, reg, cursors):
+        self.regCursorImpacts[reg] = cursors.copy()
+
+    def addRegValue(self, reg, value):
+        if reg in self.regValues:
+            values = self.regValues[reg]
+        else:
+            values = self.regValues[reg] = set()
+        alreadyPresent = value in values
+        values.add(value)
+        return not alreadyPresent
+
+    def getRegValues(self, reg):
+        if reg in self.regValues:
+            return self.regValues[reg]
+        else:
+            return set()
+
+    def checkDelta(self, other):
+        # -- cursor impact
+        # update regs the other guy also has
+        for reg, cursors in self.regCursorImpacts.items():
+            if reg in other.regCursorImpacts:
+                # difference if they don't match
+                if cursors != other.regCursorImpacts[reg]:
+                    return True
+            else: # difference if he didn't have it
+                return True
+        # different if he has something we don't have
+        for reg, cursors in other.regCursorImpacts.items():
+            if not reg in self.regCursorImpacts:
+                return True
+
+        # -- values
+        for reg, values in self.regValues.items():
+            if reg in other.regValues:
+                # diff if they don't match
+                if values != other.regValues[reg]:
+                    return True
+            else: # difference if he didn't have it
+                return True
+        # different if he has something we don't have
+        for reg, values in other.regValues.items():
+            if not reg in self.regValues:
+                return True
+
     def copy(self):
-        return RegAffectations(self)
+        return RegStates(self)
 
     def update(self, other):
-        for reg, cursors in self.regStates.items():
+        '''
+        Update the states of our registers with the states of the registers in
+        the other RegStates object.
+        '''
+        # -- cursor impact
+        # update regs the other guy also has
+        for reg, cursors in self.regCursorImpacts.items():
             # this sorta defeats our getitem magic...
-            if reg in other.regStates:
-                cursors.update(other.regStates[reg])
-        for reg, cursors in other.regStates.items():
-            if not reg in self.regStates:
-                self.regStates[reg] = cursors.copy()
+            if reg in other.regCursorImpacts:
+                cursors.update(other.regCursorImpacts[reg])
+        # copy regs we don't have (but the other guy does)
+        for reg, cursors in other.regCursorImpacts.items():
+            if not reg in self.regCursorImpacts:
+                self.regCursorImpacts[reg] = cursors.copy()
+
+        # -- values
+        for reg, values in self.regValues.items():
+            # this sorta defeats our getitem magic...
+            if reg in other.regValues:
+                values.update(other.regValues[reg])
+        # copy regs we don't have (but the other guy does)
+        for reg, values in other.regValues.items():
+            if not reg in self.regValues:
+                self.regValues[reg] = values.copy()
+
+    def __str__(self):
+        return '\n  cursor impacts: %s\n  values: %s' % (
+            repr(self.regCursorImpacts), repr(self.regValues))
 
 class BasicBlock(object):
     def __init__(self, ops):
         self.ops = ops
-        self.inRegs = RegAffectations()
-        self.outRegs = RegAffectations()
+        self.inRegs = RegStates()
+        self.outRegs = RegStates()
         self.done = False
 
         # establish a back-link for us lazy-types
@@ -166,6 +238,10 @@ class BasicBlock(object):
         else:
             return [self.ops[-1].addr + 1]
 
+    def __str__(self):
+        return 'Block id: %d last: %d comeFrom: %s goTo: %s' % (
+            self.id, self.lastAddr, self.comeFrom, self.goTo)
+
 class GenericOpInfo(object):
     '''
     Simple op meta-info.
@@ -176,21 +252,53 @@ class GenericOpInfo(object):
         self.params = params
         self.comment = comment
 
+        #: opcode addresses that may jump/flow to this opcode
         self.comeFrom = []
+        #: opcode addresses that we may transfer control to (jump or next)
         self.goTo = []
+        #: database handle-y things created by this opcode
         self.births = []
+        #: database handle-y things closed by this opcode
         self.kills = []
 
+        #: register numbers that we (may) read from
         self.regReads = []
+        #: register numbers that we (may) write to
         self.regWrites = []
+        #: the immediate value this opcode uses (if it uses one).
+        #:  We can't represent some immediates, so this may just be true
         self.usesImmediate = None
+        #: the Cursor this opcode uses for read purposes, if any
         self.usesCursor = None
+        #: the Cursor this opcode uses for write purposes, if any. implies uses
         self.writesCursor = None
+        #: the Cursor this opcode performs a seek operation on
         self.seeksCursor = None
+        #: the column numbers (on the cursor) this op accesses
         self.usesColumns = None
+        #: does this opcode terminate program execution
         self.terminate = False
+        #: does this opcode engage in dynamic jumps (and as such we should hint
+        #:  to the basic block engine to create a block)
+        self.dynamicGoTo = False
+        #: used by Gosub to track the register it writes to
+        self.dynamicWritePC = None
 
         self.affectedByCursors = set()
+
+    def ensureJumpTargets(self, addrs, adjustment=1):
+        '''
+        Make sure this opcode knows that it can jump to the given addresses
+        (probably with an adjustment).  Returns the set of targets that were
+        unknown.
+        '''
+        unknown = set()
+        for addr in addrs:
+            realAddr = addr + adjustment
+            if realAddr not in self.goTo:
+                self.goTo.append(realAddr)
+                unknown.add(realAddr)
+        return unknown
 
     def graphStr(self, schemaInfo):
         if self.usesCursor:
@@ -300,10 +408,14 @@ class ExplainGrokker(object):
         self.op.births.append(table)
         return table
 
-    def _newIndexOn(self, table, indexDetails, **kwargs):
-        # indexDetails is of the form: "keyinfo(%d,"...
+    def _parseKeyinfo(self, indexDetails):
         keyparts = indexDetails[8:-1].split(',')
         numColumns = int(keyparts[0])
+        return numColumns
+
+    def _newIndexOn(self, table, indexDetails, **kwargs):
+        # indexDetails is of the form: "keyinfo(%d,"...
+        numColumns = self._parseKeyinfo(indexDetails)
         index = Index(table=table, columns=numColumns, openedAt=self.op,
                       **kwargs)
         self.indices.append(index)
@@ -394,6 +506,20 @@ class ExplainGrokker(object):
             cursorOn = table
         self._newCursor(cursorNum, cursorOn)
 
+    def _op_Permute(self, params):
+        # it just prints "intarray" at least for non-debug.  not very helpful!
+        pass
+
+    def _op_Compare(self, params):
+        # P1..(P1+P3-1)
+        self.op.regReads.extend([params[0] + x for x in range(params[2])])
+        # P2..(P2+P3-1)
+        self.op.regReads.extend([params[1] + x for x in range(params[2])])
+        # uh, we don't use this yet.
+        self._parseKeyinfo(params[3])
+        # we contaminate the jump decision...
+        self.op.regWrites.append('for_jump')
+
     def _condJump(self, regs, target):
         if regs:
             if isinstance(regs, list):
@@ -405,6 +531,38 @@ class ExplainGrokker(object):
 
     def _jump(self, target):
         self.op.goTo.append(target)
+
+    def _op_Goto(self, params):
+        self._jump(params[1])
+        self.usesImmediate = params[1]
+
+    def _op_Jump(self, params):
+        # we base our decision on the result of the last compare
+        self.op.regReads.append('for_jump')
+        self._jump(params[0])
+        self._jump(params[1])
+        self._jump(params[2])
+
+    def _op_Gosub(self, params):
+        self.op.regWrites.append(params[0])
+        self.op.dynamicWritePC = params[0]
+        self.usesImmediate = params[1]
+        self._jump(params[1])
+
+    def _op_Yield(self, params):
+        self.op.regReads.append(params[0])
+        self.op.regWrites.append(params[0])
+        self.op.dynamicWritePC = params[0]
+        # we won't know where out goTo goes to until dataflow analysis, nor
+        #  where we would 'come from' to the next opcode.  But we do know that
+        #  after us is a basic block break, so let's hint that.
+        self.op.dynamicGoTo = params[0]
+
+    def _op_Return(self, params):
+        # just like for Yield, we have no idea where we are going until
+        #  dataflow.
+        self.op.regReads.append(params[0])
+        self.op.dynamicGoTo = params[0]
 
     def _op_Seek(self, params):
         self._getCursor(params[0], False, True)
@@ -444,6 +602,10 @@ class ExplainGrokker(object):
         self.op.regWrites.append(params[1])
     def _op_Rowid(self, params):
         self._op_IdxRowid(params)
+    def _op_NewRowid(self, params):
+        self._getCursor(params[0])
+        self.op.regReads.append(params[2])
+        self.op.regWrites.extend(params[1:3])
 
     def _op_NotExists(self, params):
         self._getCursor(params[0], False, True)
@@ -514,9 +676,6 @@ class ExplainGrokker(object):
 
     def _op_Close(self, params):
         self._killCursor(params[0])
-
-    def _op_Goto(self, params):
-        self._jump(params[1])
 
     def _op_IsNull(self, params):
         if params[2]:
@@ -635,8 +794,11 @@ class ExplainGrokker(object):
             else:
                 print 'Ignoring opcode', opcode
 
-        self.figureBasicBlocks()
-        self.dataFlow()
+        needReflow = True
+        while needReflow:
+            print '--- dataflow pass happening ---'
+            self.figureBasicBlocks()
+            needReflow = self.dataFlow()
 
     def figureBasicBlocks(self):
         # build comeFrom links
@@ -647,7 +809,10 @@ class ExplainGrokker(object):
                     continue
                 print 'at op', op.addr, 'goTo', addr
                 targ_op = self.code[addr]
-                targ_op.comeFrom.append(op.addr)
+                if op.addr not in targ_op.comeFrom:
+                    targ_op.comeFrom.append(op.addr)
+                else:
+                    print 'not adding?'
 
         self.basicBlocks = {}
         self.basicBlocksByEnd = {}
@@ -655,19 +820,24 @@ class ExplainGrokker(object):
         # build the blocks
         block_ops = []
         for op in self.code:
+            # if we come from somewhere, then we start a new block (and create
+            #  a basic block for any opcodes queued in block_ops)
             if op.comeFrom:
                 if block_ops:
                     block = BasicBlock(block_ops)
+                    print 'new', block
                     self.basicBlocks[block.id] = block
                     self.basicBlocksByEnd[block.lastAddr] = block
-                block_ops = [op]
-            else:
-                block_ops.append(op)
-                if op.goTo:
-                    block = BasicBlock(block_ops)
-                    self.basicBlocks[block.id] = block
-                    self.basicBlocksByEnd[block.lastAddr] = block
-                    block_ops = []
+                block_ops = []
+            block_ops.append(op)
+            # if this op jumps places, then close out this set of block_ops
+            #  into a basic block.
+            if op.goTo or op.dynamicGoTo != False:
+                block = BasicBlock(block_ops)
+                print 'new', block
+                self.basicBlocks[block.id] = block
+                self.basicBlocksByEnd[block.lastAddr] = block
+                block_ops = []
 
     def colorCursors(self):
         TANGO_COLORS = ['#73d216', '#3465a4', '#75507b', '#cc0000',
@@ -727,12 +897,22 @@ class ExplainGrokker(object):
     def dataFlow(self):
         todo = [self.basicBlocks[0]]
 
+        # dynamic jumps can require the CFG to be rebuilt, although we try and
+        #  avoid that where possible.  This variable tracks this, which requires
+        #  us to re-build our CFG and re-process things.  Thankfully all our
+        #  results that have already been computed should still be accurate, we
+        #  just might need to flow things even further.
+        cfgInvalid = False
+
         def goToBlocks(block):
             for addr in block.goTo:
                 yield self.basicBlocks[addr]
 
         def comeFromBlocks(block):
             for addr in block.comeFrom:
+                if not addr in self.basicBlocksByEnd:
+                    print 'PROBLEM! no such comeFrom on addr', addr, 'for block:'
+                    print block
                 yield self.basicBlocksByEnd[addr]
 
         def originBlocksDone(block):
@@ -741,17 +921,35 @@ class ExplainGrokker(object):
                     return False
             return True
 
+        def ensureJumpTargets(op, addrs, adjustment=1):
+            # This returns the (adjusted) addresses of jumps that are new to
+            #  us.  We need to check to make sure there is actually a basic
+            #  block that starts there.  If not, we need to mark the CFG
+            #  invalid and requiring a re-processing.
+            print 'adding dynamic jumps to', addrs, 'from', op
+            unknownRealAddrs = op.ensureJumpTargets(addrs, adjustment)
+            for unknownRealAddr in unknownRealAddrs:
+                if not unknownRealAddr in self.basicBlocks:
+                    print '!' * 80
+                    print 'WARNING, CFG split at', unknownRealAddr, 'required'
+                    print 'Jerky opcode is', op
+                    print '!' * 80
+                    cfgInvalid = True
+            return unknownRealAddrs
+
         def flowBlock(block):
             changes = False
 
             for parent in comeFromBlocks(block):
                 block.inRegs.update(parent.outRegs)
+            print 'inRegs', block.inRegs
             curRegs = block.inRegs.copy()
+            print 'curRegs', curRegs
 
             for op in block.ops:
                 # affect the operation for its input regs
                 for reg in op.regReads:
-                    op.affectedByCursors.update(curRegs[reg])
+                    op.affectedByCursors.update(curRegs.getRegCursorImpacts(reg))
 
                 if op.writesCursor: # implies usesCursor
                     op.usesCursor.writesAffectedBy.update(op.affectedByCursors)
@@ -760,22 +958,36 @@ class ExplainGrokker(object):
 
                 # affect the output registers
                 for reg in op.regWrites:
-                    if curRegs[reg] != op.affectedByCursors:
-                        print 'change', reg, curRegs[reg], op.affectedByCursors
-                        curRegs[reg] = op.affectedByCursors
+                    if curRegs.getRegCursorImpacts(reg) != op.affectedByCursors:
+                        print 'change', reg, curRegs.getRegCursorImpacts(reg), op.affectedByCursors
+                        curRegs.setRegCursorImpacts(reg, op.affectedByCursors)
+                        #changes = True
+
+                # stuff for Gosub, Yield, Return
+                if op.dynamicWritePC:
+                    curRegs.addRegValue(op.dynamicWritePC, op.addr)
+                if op.dynamicGoTo:
+                    if ensureJumpTargets(op, curRegs.getRegValues(op.dynamicGoTo)):
+                        # jump target changes are mutations of the CFG and
+                        #  require change processing!
                         changes = True
 
-            block.outRegs = curRegs
+            if block.outRegs.checkDelta(curRegs):
+                changes = True
+                block.outRegs = curRegs
+            print 'outRegs', block.outRegs
 
             return changes
 
         while todo:
             block = todo.pop()
-            print 'processing block', block.id
+            print '................'
+            print 'processing block', block
             # if a change happened, the block is not done, and his kids are not
             #  done (and need to be processed)
             if flowBlock(block):
                 block.done = False
+                print 'Changes on', block
                 for child in goToBlocks(block):
                     child.done = False
                     if not child in todo:
@@ -788,6 +1000,8 @@ class ExplainGrokker(object):
                     if not child.done:
                         if not child in todo:
                             todo.insert(0, child)
+
+        return cfgInvalid
 
     def diagDataFlow(self, outpath):
         self.colorCursors()
