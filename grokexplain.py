@@ -701,6 +701,8 @@ class ExplainGrokker(object):
         self._condJump([params[0]], params[1])
     def _op_IfNot(self, params):
         self._condJump([params[0]], params[1])
+    def _op_IfPos(self, params):
+        self._condJump([params[0]], params[1])
 
     def _op_Eq(self, params):
         self._condJump([params[0], params[2]], params[1])
