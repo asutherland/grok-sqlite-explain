@@ -206,6 +206,12 @@ class RegStates(object):
         return '\n  cursor impacts: %s\n  values: %s' % (
             repr(self.regCursorImpacts), repr(self.regValues))
 
+    def graphStr(self):
+        s = ''
+        for reg, values in self.regValues.items():
+            s += 'r%s: %s' % (reg, values)
+        return s
+
 class BasicBlock(object):
     def __init__(self, ops):
         self.ops = ops
@@ -887,8 +893,12 @@ class ExplainGrokker(object):
 
         g = pygraphviz.AGraph(directed=True, strict=False)
         for block in self.basicBlocks.values():
-            ltext = "<<" + '\\n'.join(
-                [op.graphStr(self.schemaInfo) for op in block.ops]) + "\\n>>"
+            ltext = ("<<" +
+              (DEBUG and (block.inRegs.graphStr() + '\\n') or '') +
+              '\\n'.join(
+                [op.graphStr(self.schemaInfo) for op in block.ops]) +
+              (DEBUG and ('\\n' + block.outRegs.graphStr()) or '') +
+              "\\n>>")
             g.add_node(block.id, label=ltext)
 
         for block in self.basicBlocks.values():
@@ -935,10 +945,15 @@ class ExplainGrokker(object):
             #  us.  We need to check to make sure there is actually a basic
             #  block that starts there.  If not, we need to mark the CFG
             #  invalid and requiring a re-processing.
+            # Also, we need to fix up comeFrom
             print 'adding dynamic jumps to', addrs, 'from', op
             unknownRealAddrs = op.ensureJumpTargets(addrs, adjustment)
             for unknownRealAddr in unknownRealAddrs:
-                if not unknownRealAddr in self.basicBlocks:
+                if unknownRealAddr in self.basicBlocks:
+                    other = self.basicBlocks[unknownRealAddr]
+                    if not op.addr in other.comeFrom:
+                        other.comeFrom.append(op.addr)
+                else:
                     print '!' * 80
                     print 'WARNING, CFG split at', unknownRealAddr, 'required'
                     print 'Jerky opcode is', op
@@ -1045,6 +1060,11 @@ class ExplainGrokker(object):
 
 
 if __name__ == '__main__':
+    global DEBUG
+
+    import sys
+    DEBUG = 'debug' in sys.argv
+
     sg = SchemaGrokker()
     sf = open('/tmp/schemainfo.txt')
     sg.grok(sf)
