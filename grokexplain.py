@@ -7,7 +7,7 @@
 
 import pygraphviz
 import cStringIO as StringIO
-import os
+import os, os.path
 import optparse
 
 class TableSchema(object):
@@ -325,7 +325,7 @@ class GenericOpInfo(object):
                      'Return': '#ff00ff'}
     def graphStr(self, schemaInfo):
         if self.usesCursor:
-            s = "<font color='%s'>%d %s [%d]</font>" % (
+            s = "<font color='%s'>%d %s [%s]</font>" % (
                 self.usesCursor.color, self.addr, self.name,
                 self.usesCursor.handle)
         elif self.name in self.HIGHLIGHT_OPS:
@@ -348,7 +348,7 @@ class GenericOpInfo(object):
                 s += ' (' + ' '.join(cursorStrings) + ')'
 
         if self.usesCursor and self.births:
-            if self.usesCursor in self.births:
+            if self.usesCursor in self.births and self.usesCursor.on:
                 s += ' %s' % (self.usesCursor.on.name,)
 
         if self.usesImmediate is not None:
@@ -477,6 +477,7 @@ class ExplainGrokker(object):
             cursor = self.cursorByHandle[vtabkey]
         else:
             cursor = Cursor(handle=vtabkey, on=None)
+            self.cursors.append(cursor)
             self.cursorByHandle[vtabkey] = cursor
             
         self.op.usesCursor = cursor
@@ -687,7 +688,9 @@ class ExplainGrokker(object):
         # This is used in conjunction with VUpdate without any VOpen.  Although
         # there is no real cursor that results from this, the usage is akin to a
         # cursor...
-        self._getVtable(params[3])
+        vtcursor = self._getVtable(params[3])
+        self.op.births.append(vtcursor)
+        vtcursor.openedAt=self.op
 
     def _op_VUpdate(self, params):
         # performs virtual table INSERT and/or DELETE
@@ -946,10 +949,13 @@ class ExplainGrokker(object):
             addr = row[0]
             opcode = row[1]
             params = row[2:7] # p1 - p5
-            comment = row[7]
+            comment = row[7] and str(row[7]) # the graphviz code hates unicode.
 
             if params[3].isdigit():
                 params[3] = int(params[3])
+            else:
+                # JSON returns unicode but graphviz hates it.
+                params[3] = str(params[3])
 
             # opcode renaming compensation...
             if opcode.startswith('Move') and len(opcode) > 4:
@@ -1059,7 +1065,7 @@ class ExplainGrokker(object):
                 [op.graphStr(self.schemaInfo) for op in block.ops]) +
               (DEBUG and ('\\n' + block.outRegs.graphStr()) or '') +
               "\\n>>")
-            g.add_node(block.id, label=ltext)
+            g.add_node(block.id, label=str(ltext))
 
         for block in self.basicBlocks.values():
             for addr in block.goTo:
@@ -1204,7 +1210,7 @@ class ExplainGrokker(object):
         for cursor in self.cursors:
             label = "<<<font color='%s'>%s</font>>>" % (
                 cursor.color, cursor)
-            g.add_node(cursor.id, label=label)
+            g.add_node(cursor.id, label=str(label))
         for cursor in self.cursors:
             for originCursor in cursor.writesAffectedBy:
                 g.add_edge(originCursor.id, cursor.id)
@@ -1249,6 +1255,13 @@ class CmdLine(object):
                           action='store_true', dest='verbose', default=False,
                           help='Output a lot of info about what we are doing.')
 
+        parser.add_option('-o', '--output-dir',
+                          dest='out_dir', default=None,
+                          help='Directory to output results in.')
+        parser.add_option('--dataflow',
+                          action='store_true', dest='dataflow', default=False,
+                          help='Output dataflow overview.')
+
         return parser
     
     def run(self):
@@ -1261,6 +1274,10 @@ class CmdLine(object):
         NO_YIELDS = not options.yields
         VERBOSE = options.verbose
 
+        if options.out_dir:
+            if not os.path.exists(options.out_dir):
+                os.mkdir(options.out_dir)
+
         for filename in args:
             if filename.endswith('.json'):
                 import json
@@ -1268,11 +1285,23 @@ class CmdLine(object):
                 obj = json.load(f)
                 f.close()
 
-                for query in obj["queries"]:
+                for iQuery, query in enumerate(obj["queries"]):
                     print 'PROCESSING', query["sql"]
                     eg = ExplainGrokker()
                     eg.parseJsonOpcodesList(query["operations"])
                     eg.performFlow()
+                    
+                    if options.out_dir:
+                        blockpath = os.path.join(options.out_dir,
+                                                 '%d-blocks.dot' % (iQuery,))
+                        eg.diagBasicBlocks(blockpath)
+
+                    if options.out_dir and options.dataflow:
+                        flowpath = os.path.join(options.out_dir,
+                                                '%d-flow.dot' % (iQuery,))
+                        eg.diagDataFlow(flowpath)
+
+
         
 
 
