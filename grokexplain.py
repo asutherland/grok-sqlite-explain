@@ -4,17 +4,26 @@
 # Andrew Sutherland <asutherland@asutherland.org>
 # Mozilla Messaging, Inc.
 
+
 import pygraphviz
 import cStringIO as StringIO
 import os
+import optparse
 
 class TableSchema(object):
+    '''
+    Table meta-data; the name of a table and its columns.
+    '''
     def __init__(self, name, colnames):
         self.name = name
         self.columns = colnames
         
 
 class SchemaGrokker(object):
+    '''
+    Parses a schema dump like "sqlite3 DATABASE .schema" outputs for info
+    about tables and virtual tables.
+    '''
     def __init__(self):
         self.tables = {}
         self.virtualTables = {}
@@ -74,7 +83,7 @@ class Table(object):
 
 class Index(object):
     def __init__(self, **kwargs):
-        self.on = kwargs.pop('table')
+        self.on = kwargs.pop('table', None)
         self.name = kwargs.pop('name')
         self.columns = kwargs.pop('columns')
         self.openedAt = kwargs.pop('openedAt', None)
@@ -112,9 +121,11 @@ class RegStates(object):
         if copyFrom:
             for reg, cursors in copyFrom.regCursorImpacts.items():
                 self.regCursorImpacts[reg] = cursors.copy()
-                print ' copying cursors', reg, cursors
+                if VERBOSE:
+                    print ' copying cursors', reg, cursors
             for reg, values in copyFrom.regValues.items():
-                print ' copying values', reg, values
+                if VERBOSE:
+                    print ' copying values', reg, values
                 self.regValues[reg] = values.copy()
 
     def getRegCursorImpacts(self, reg):
@@ -373,7 +384,10 @@ class ExplainGrokker(object):
     def __init__(self):
         self.ephemeralTables = []
         self.virtualTables = []
+        #: maps "vtab:*:*" strings to Table instances...
+        self.vtableObjs = {}
         self.realTables = []
+        self.realTablesByName = {}
         self.pseudoTables = []
 
         self.allTables = []
@@ -392,27 +406,22 @@ class ExplainGrokker(object):
         self.op.births.append(table)
         return table
 
-    def _newVirtualTable(self, **kwargs):
-        # TODO: have some means of figuring out what table it is other
-        #  than by default!
-        if len(self.schemaInfo.virtualTables) == 1:
-            kwargs['schema'] = self.schemaInfo.virtualTables.values()[0]
-
+    def _newVirtualTable(self, vtabkey, **kwargs):
         table = Table(virtual=True, openedAt=self.op, **kwargs)
+        self.vtableObjs[vtabkey] = table
         self.virtualTables.append(table)
         self.allTables.append(table)
         self.op.births.append(table)
         return table
 
-    def _newRealTable(self, **kwargs):
-        # TODO: have some means of figuring out what table it is other
-        #  than by default!
-        if len(self.schemaInfo.tables) == 1:
-            kwargs['schema'] = self.schemaInfo.tables.values()[0]
-
-        table = Table(openedAt=self.op, **kwargs)
-        self.realTables.append(table)
-        self.allTables.append(table)
+    def _newRealTable(self, name, **kwargs):
+        if name in self.realTablesByName:
+            table = self.realTablesByName[name]
+        else:
+            table = Table(name=name, openedAt=self.op, **kwargs)
+            self.realTables.append(table)
+            self.realTablesByName[name] = table
+            self.allTables.append(table)
         self.op.births.append(table)
         return table
 
@@ -428,10 +437,10 @@ class ExplainGrokker(object):
         numColumns = int(keyparts[0])
         return numColumns
 
-    def _newIndexOn(self, table, indexDetails, **kwargs):
+    def _newIndexOn(self, indexDetails, **kwargs):
         # indexDetails is of the form: "keyinfo(%d,"...
         numColumns = self._parseKeyinfo(indexDetails)
-        index = Index(table=table, columns=numColumns, openedAt=self.op,
+        index = Index(columns=numColumns, openedAt=self.op,
                       **kwargs)
         self.indices.append(index)
         self.op.births.append(index)
@@ -439,10 +448,14 @@ class ExplainGrokker(object):
 
     def _newCursor(self, handle, thing, **kwargs):
         if handle in self.cursorByHandle:
-            raise Exception('ERROR! Cursor handle collision; need more clever!')
-        cursor = Cursor(handle=handle, on=thing, openedAt=self.op, **kwargs)
-        self.cursors.append(cursor)
-        self.cursorByHandle[handle] = cursor
+            # R/W change is okay
+            cursor = self.cursorByHandle[handle]
+            if cursor.on != thing:
+                raise Exception('ERROR! Cursor handle collision!')
+        else:
+            cursor = Cursor(handle=handle, on=thing, openedAt=self.op, **kwargs)
+            self.cursors.append(cursor)
+            self.cursorByHandle[handle] = cursor
         self.op.births.append(cursor)
         self.op.usesCursor = cursor
         self.op.affectedByCursors.add(cursor)
@@ -455,6 +468,22 @@ class ExplainGrokker(object):
         self.op.seeksCursor = seek
         self.op.affectedByCursors.add(cursor)
         return cursor
+
+    def _getVtable(self, vtabkey, write=False):
+        '''
+        Given a P4-resident "vtab:*:*" 
+        '''
+        if vtabkey in self.cursorByHandle:
+            cursor = self.cursorByHandle[vtabkey]
+        else:
+            cursor = Cursor(handle=vtabkey, on=None)
+            self.cursorByHandle[vtabkey] = cursor
+            
+        self.op.usesCursor = cursor
+        self.op.writesCursor = write
+        self.op.affectedByCursors.add(cursor)
+        return cursor
+        
 
     def _killThing(self, thing):
         self.op.kills.append(thing)
@@ -471,17 +500,19 @@ class ExplainGrokker(object):
         self._killThing(cursor)
 
     def _op_OpenCommon(self, params, writable):
+        # if P4 is a keyinfo, then it's an index and comment is the name of the
+        #  index.
+        # if P4 is not a keyinfo, then it's the number of columns in the table
+        #  and comment is the name of the table.
         cursorNum = params[0]
-        indexDetails = params[3]
 
-        table = self._newRealTable(
-            name=("table%d:%d" % (cursorNum, params[1])),
-            columns = self.nextOpInfo)
-        if indexDetails:
-            cursorOn = self._newIndexOn(table, indexDetails,
-                                        name="index%d" % (cursorNum,))
+        if isinstance(params[3], basestring):
+            indexDetails = params[3]
+            cursorOn = self._newIndexOn(indexDetails,
+                                        name=self.op.comment)
         else:
-            cursorOn = table
+            cursorOn = self._newRealTable(self.op.comment,
+                                          columns=params[3])
 
         self._newCursor(cursorNum, cursorOn, writable=writable)
 
@@ -498,12 +529,11 @@ class ExplainGrokker(object):
             columns=self.nextOpInfo)
         self._newCursor(cursorNum, table, copy=params[1]==0)
 
-    def _op_SetNumColumns(self, params):
-        self.nextOpInfo = params[1]
-
     def _op_VOpen(self, params):
+        # p1: cursor number
+        # p4: vtable structure
         cursorNum = params[0]
-        table = self._newVirtualTable(
+        table = self._newVirtualTable(params[3],
             name=("virtual%d" % (cursorNum,)))
         self._newCursor(cursorNum, table)
 
@@ -515,7 +545,8 @@ class ExplainGrokker(object):
             name=("ephemeral%d" % (cursorNum,)),
             columns=numColumns)
         if indexDetails:
-            cursorOn = self._newIndexOn(table, indexDetails,
+            cursorOn = self._newIndexOn(indexDetails,
+                                        table=table,
                                         name="eindex%d" % (cursorNum,))
         else:
             cursorOn = table
@@ -585,6 +616,10 @@ class ExplainGrokker(object):
         self.op.regReads.append(params[0])
         self.op.dynamicGoTo = params[0]
 
+    def _op_NullRow(self, params):
+        # moves us to a no-op row
+        self._getCursor(params[0], False, True)
+
     def _op_Seek(self, params):
         self._getCursor(params[0], False, True)
         self.op.regReads.append(params[1])
@@ -628,6 +663,16 @@ class ExplainGrokker(object):
         self.op.regReads.append(params[2])
         self.op.regWrites.extend(params[1:3])
 
+    def _op_RowSetAdd(self, params):
+        # reg[p2] => reg[p1]
+        self.op.regReads.append(params[1])
+        self.op.regWrites.append(params[0])
+
+    def _op_RowSetRead(self, params):
+        # extract from reg[p1] => reg[p3], or conditional jump to p2
+        self._condJump(params[0], params[1])
+        self.op.regWrites.append(params[2])
+
     def _op_NotExists(self, params):
         self._getCursor(params[0], False, True)
         self._condJump(params[2], params[1])
@@ -637,6 +682,22 @@ class ExplainGrokker(object):
         self._condJump(params[2], params[1])
     def _op_NotFound(self, params):
         self._op_Found(params)
+
+    def _op_VBegin(self, params):
+        # This is used in conjunction with VUpdate without any VOpen.  Although
+        # there is no real cursor that results from this, the usage is akin to a
+        # cursor...
+        self._getVtable(params[3])
+
+    def _op_VUpdate(self, params):
+        # performs virtual table INSERT and/or DELETE
+        # p1 is whether we should update the last_insert_rowid value
+        # p2 is the number of arguments
+        # p3 is the register index of the first argument (of which we have p2
+        #  arguments)
+        # p4 is the vtable we are operating on ("vtab:*:*")
+        self.op.regReads.extend([params[2] + x for x in range(params[1])])
+        self._getVtable(params[3], True)
 
     def _op_VFilter(self, params):
         self._getCursor(params[0], False, True)
@@ -670,6 +731,13 @@ class ExplainGrokker(object):
     def _op_VColumn(self, params):
         self._op_Column(params)
 
+    def _op_Affinity(self, params):
+        '''
+        This sets the data type of a bunch of registers...
+        Treating this as a nop since it doesn't really do anything.
+        '''
+        pass
+
     def _op_MakeRecord(self, params):
         self.op.regReads.extend([params[0] + x for x in range(params[1])])
         # writes to reg p3
@@ -680,6 +748,7 @@ class ExplainGrokker(object):
         self.resultRowOps.append(self.op)
 
     def _op_Insert(self, params):
+        # P4 is the table...
         self._getCursor(params[0], True)
         self.op.regReads.extend([params[1], params[2]])
 
@@ -690,6 +759,12 @@ class ExplainGrokker(object):
     def _op_Delete(self, params):
         # a delete is a write...
         self._getCursor(params[0], True)
+
+    def _op_IdxDelete(self, params):
+        # delete from cursor P1
+        # index key is packed into p2...p2+p3-1p
+        self._getCursor(params[0], True)
+        self.op.regReads.extend([params[1] + x for x in range(params[2])])
 
     def _op_Sequence(self, params):
         self._getCursor(params[0])
@@ -741,6 +816,14 @@ class ExplainGrokker(object):
     def _op_IfZero(self, params):
         self._condJump([params[0]], params[1])
 
+    def _op_Variable(self, params):
+        # bound parameters P1..P1+P3-1 transferred to regs P2...P2+P3-1
+        # when P3==1, P4 should hold the name.
+        self.op.regWrites.extend([params[1] + x for x in range(params[2])])
+        if params[2] == 1 and params[3]:
+            # just put the binding name in the commment; it visually works
+            self.op.comment = params[3]
+
     def _op_Move(self, params):
         self.op.regReads.extend([params[0] + x for x in range(params[2])])
         self.op.regWrites.extend([params[1] + x for x in range(params[2])])
@@ -782,7 +865,35 @@ class ExplainGrokker(object):
     def _op_Halt(self, params):
         self.op.terminate = True
 
-    def grok(self, file_or_lines, schemaInfo=None):
+    def _op_HaltIfNull(self, params):
+        # halts if reg[P3] is null.
+        self.op.regReads.append(params[2])
+
+    def _op_VerifyCookie(self, params):
+        # schema delta check.  no one cares.
+        pass
+
+    def _op_Noop(self, params):
+        # used as a jump target apparently
+        pass
+
+    def _op_TableLock(self, params):
+        # Table locks are boring
+        pass
+
+    def _op_Transaction(self, params):
+        # Transactions are currently boring.
+        pass
+
+    def _op_Trace(self, params):
+        # Trace is used for EXPLAIN and is a no-op.
+        pass
+
+    def parseExplainTextFile(self, file_or_lines, schemaInfo=None):
+        '''
+        Process the text-formatted results of an EXPLAIN query like what would
+        would get from invoking "sqlite DATABASE 'EXPLAIN ...'".
+        '''
         self.schemaInfo = schemaInfo or SchemaGrokker()
 
         def chewParams(params):
@@ -817,6 +928,44 @@ class ExplainGrokker(object):
             else:
                 print 'Ignoring opcode', opcode
 
+    
+    def parseJsonOpcodesList(self, opcodeList):
+        '''
+        Process a python list where each entry in the list is itself a list
+        representing a row of EXPLAIN output.  The columns are then:
+        [addr (int), opcode (string), p1 (int), p2 (int), p3 (int), p4 (string),
+        p5 (int), comment (string or None)].
+
+        In a SQLite build built with -DDEBUG, the comment will be the name of
+        the column where appropriate.  This eliminates the need to have
+        metadata available.
+        '''
+        self.schemaInfo = SchemaGrokker()
+
+        for row in opcodeList:
+            addr = row[0]
+            opcode = row[1]
+            params = row[2:7] # p1 - p5
+            comment = row[7]
+
+            if params[3].isdigit():
+                params[3] = int(params[3])
+
+            # opcode renaming compensation...
+            if opcode.startswith('Move') and len(opcode) > 4:
+                opcode = opcode.replace('Move', 'Seek')
+
+            self.op = GenericOpInfo(addr, opcode, params, comment)
+            self.code.append(self.op)
+
+            handler = getattr(self, "_op_" + opcode, None)
+            if handler:
+                handler(params)
+            else:
+                print 'Ignoring opcode', opcode
+            
+
+    def performFlow(self):
         needReflow = True
         while needReflow:
             print '--- dataflow pass happening ---'
@@ -830,11 +979,12 @@ class ExplainGrokker(object):
                 # ignore exception magic
                 if isinstance(addr, basestring):
                     continue
-                print 'at op', op.addr, 'goTo', addr
+                if VERBOSE:
+                    print 'at op', op.addr, 'goTo', addr
                 targ_op = self.code[addr]
                 if op.addr not in targ_op.comeFrom:
                     targ_op.comeFrom.append(op.addr)
-                else:
+                elif VERBOSE:
                     print 'not adding?'
 
         self.basicBlocks = {}
@@ -848,7 +998,8 @@ class ExplainGrokker(object):
             if op.comeFrom:
                 if block_ops:
                     block = BasicBlock(block_ops)
-                    print 'new', block
+                    if VERBOSE:
+                        print 'new', block
                     self.basicBlocks[block.id] = block
                     self.basicBlocksByEnd[block.lastAddr] = block
                 block_ops = []
@@ -857,7 +1008,8 @@ class ExplainGrokker(object):
             #  into a basic block.
             if op.goTo or op.dynamicGoTo != False:
                 block = BasicBlock(block_ops)
-                print 'new', block
+                if VERBOSE:
+                    print 'new', block
                 self.basicBlocks[block.id] = block
                 self.basicBlocksByEnd[block.lastAddr] = block
                 block_ops = []
@@ -957,7 +1109,8 @@ class ExplainGrokker(object):
             #  block that starts there.  If not, we need to mark the CFG
             #  invalid and requiring a re-processing.
             # Also, we need to fix up comeFrom
-            print 'adding dynamic jumps to', addrs, 'from', op
+            if VERBOSE:
+                print 'adding dynamic jumps to', addrs, 'from', op
             unknownRealAddrs = op.ensureJumpTargets(addrs, adjustment)
             for unknownRealAddr in unknownRealAddrs:
                 if unknownRealAddr in self.basicBlocks:
@@ -977,9 +1130,11 @@ class ExplainGrokker(object):
 
             for parent in comeFromBlocks(block):
                 block.inRegs.update(parent.outRegs)
-            print 'inRegs', block.inRegs
+            if VERBOSE:
+                print 'inRegs', block.inRegs
             curRegs = block.inRegs.copy()
-            print 'curRegs', curRegs
+            if VERBOSE:
+                print 'curRegs', curRegs
 
             for op in block.ops:
                 # affect the operation for its input regs
@@ -994,7 +1149,8 @@ class ExplainGrokker(object):
                 # affect the output registers
                 for reg in op.regWrites:
                     if curRegs.getRegCursorImpacts(reg) != op.affectedByCursors:
-                        print 'change', reg, curRegs.getRegCursorImpacts(reg), op.affectedByCursors
+                        if VERBOSE:
+                            print 'change', reg, curRegs.getRegCursorImpacts(reg), op.affectedByCursors
                         curRegs.setRegCursorImpacts(reg, op.affectedByCursors)
                         #changes = True
 
@@ -1010,19 +1166,22 @@ class ExplainGrokker(object):
             if block.outRegs.checkDelta(curRegs):
                 changes = True
                 block.outRegs = curRegs
-            print 'outRegs', block.outRegs
+            if VERBOSE:
+                print 'outRegs', block.outRegs
 
             return changes
 
         while todo:
             block = todo.pop()
-            print '................'
-            print 'processing block', block
+            if VERBOSE:
+                print '................'
+                print 'processing block', block
             # if a change happened, the block is not done, and his kids are not
             #  done (and need to be processed)
             if flowBlock(block):
                 block.done = False
-                print 'Changes on', block
+                if VERBOSE:
+                    print 'Changes on', block
                 for child in goToBlocks(block):
                     child.done = False
                     if not child in todo:
@@ -1069,13 +1228,61 @@ class ExplainGrokker(object):
         for table in self.allTables:
             print '  ', table
 
+class CmdLine(object):
+    usage = '''usage: %prog [options] explained.json/explained.txt
+
+    We process SQLite EXPLAIN output in order to visualize it using graphviz.
+    We require that your SQLite was built with -DDEBUG because then we get
+    useful schema meta-data from the comment column and we really enjoy that.
+    '''
+
+    def buildParser(self):
+        parser = optparse.OptionParser(usage=self.usage)
+
+        parser.add_option('-d', '--debug',
+                          action='store_true', dest='debug', default=False,
+                          help='Dump registers at block entry/exit')
+        parser.add_option('-y', '--yields',
+                          action='store_true', dest='yields', default=False,
+                          help='Process yields for control/dataflow analysis.')
+        parser.add_option('-v', '--verbose',
+                          action='store_true', dest='verbose', default=False,
+                          help='Output a lot of info about what we are doing.')
+
+        return parser
+    
+    def run(self):
+        global DEBUG, NO_YIELDS, VERBOSE
+
+        parser = self.buildParser()
+        options, args = parser.parse_args()
+
+        DEBUG = options.debug
+        NO_YIELDS = not options.yields
+        VERBOSE = options.verbose
+
+        for filename in args:
+            if filename.endswith('.json'):
+                import json
+                f = open(filename, 'r')
+                obj = json.load(f)
+                f.close()
+
+                for query in obj["queries"]:
+                    print 'PROCESSING', query["sql"]
+                    eg = ExplainGrokker()
+                    eg.parseJsonOpcodesList(query["operations"])
+                    eg.performFlow()
+        
+
 
 if __name__ == '__main__':
-    global DEBUG, NO_YIELDS
 
+    cmdline = CmdLine()
+    cmdline.run()
+    
     import sys
-    DEBUG = 'debug' in sys.argv
-    NO_YIELDS = 'yields' not in sys.argv
+    sys.exit(0)
 
     sg = SchemaGrokker()
     sf = open('/tmp/schemainfo.txt')
