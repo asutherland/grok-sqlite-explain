@@ -304,6 +304,9 @@ class GenericOpInfo(object):
         #: used by Gosub to track the register it writes to
         self.dynamicWritePC = None
 
+        #: (potentially normalized) number of times opcode invoked
+        self.invocCount = None
+
         self.affectedByCursors = set()
 
     def ensureJumpTargets(self, addrs, adjustment=1):
@@ -324,15 +327,39 @@ class GenericOpInfo(object):
                      'Gosub': '#ff00ff',
                      'Return': '#ff00ff'}
     def graphStr(self, schemaInfo):
-        if self.usesCursor:
-            s = "<font color='%s'>%d %s [%s]</font>" % (
-                self.usesCursor.color, self.addr, self.name,
-                self.usesCursor.handle)
-        elif self.name in self.HIGHLIGHT_OPS:
-            s = "%d <font color='%s'>%s</font>" % (
-                self.addr, self.HIGHLIGHT_OPS[self.name], self.name)
+        if HAVE_COUNTS:
+            count = self.invocCount or 0
+            if count == 0:
+                s = "<font color='#ffffff'>||||| </font>"
+            elif count == 1:
+                s = ("<font color='#4aba4a'>|</font>" +
+                     "<font color='#ffffff'>|||| </font>")
+            elif count == 2:
+                s = ("<font color='#119125'>|</font>" +
+                     "<font color='#ffffff'>|||| </font>")
+            elif count <= 10:
+                s = ("<font color='#119125'>||</font>" +
+                     "<font color='#ffffff'>||| </font>")
+            elif count <= 100:
+                s = ("<font color='#f5eb33'>|||</font>" +
+                     "<font color='#ffffff'>|| </font>")
+            elif count <= 1000:
+                s = ("<font color='#ad1316'>||||</font>" +
+                     "<font color='#ffffff'>| </font>")
+            else:
+                s = "<font color='#ad1316'>||||| </font>"
         else:
-            s = '%d %s' % (self.addr, self.name)
+            s = ''
+
+        if self.usesCursor:
+            s += "<font color='%s'>%d %s [%s]</font>" % (
+                 self.usesCursor.color, self.addr, self.name,
+                 self.usesCursor.handle)
+        elif self.name in self.HIGHLIGHT_OPS:
+            s += "%d <font color='%s'>%s</font>" % (
+                 self.addr, self.HIGHLIGHT_OPS[self.name], self.name)
+        else:
+            s += '%d %s' % (self.addr, self.name)
 
         if self.affectedByCursors:
             cursors = list(self.affectedByCursors)
@@ -932,7 +959,7 @@ class ExplainGrokker(object):
                 print 'Ignoring opcode', opcode
 
     
-    def parseJsonOpcodesList(self, opcodeList):
+    def parseJsonOpcodesList(self, opcodeList, counts=None):
         '''
         Process a python list where each entry in the list is itself a list
         representing a row of EXPLAIN output.  The columns are then:
@@ -963,6 +990,9 @@ class ExplainGrokker(object):
 
             self.op = GenericOpInfo(addr, opcode, params, comment)
             self.code.append(self.op)
+            # if we have a count for this opcode, set it
+            if counts and len(counts) > addr:
+                self.op.invocCount = counts[addr]
 
             handler = getattr(self, "_op_" + opcode, None)
             if handler:
@@ -1234,6 +1264,73 @@ class ExplainGrokker(object):
         for table in self.allTables:
             print '  ', table
 
+class VdbeStats(object):
+    '''
+    Process output from sqlite-perf.stp.  It emits a data structure with the
+    following form:
+    {
+      "stats": [
+        {"sql": "SQL STRING, possibly <unknown>",
+         "counts": [1,1,1,5,5,2,1]
+        },
+        ...
+      ]
+    }
+    '''
+
+    #: The minimum 
+    SIGNIFICANT_THRESHOLD = 64
+
+    def __init__(self):
+        self.sqlToInstances = {}
+        self.sqlToSignificant = {}
+
+    def parseJsonStats(self, path):
+        import json
+        f = open(path, 'r')
+        obj = json.load(f)
+        f.close()
+
+        for row in obj["stats"]:
+            sql = row["sql"]
+            if sql in self.sqlToInstances:
+                instances = self.sqlToInstances[sql]
+            else:
+                instances = self.sqlToInstances[sql] = []
+            instances.append(row)
+
+    def hasStats(self, sql):
+        return sql in self.sqlToInstances
+
+    def hasSignificantStats(self, sql):
+        '''
+        Scan all instances for a count >= than the significance threshold.
+        We save off the first significant guy we find.
+        '''
+        if not sql in self.sqlToInstances:
+            return False
+
+        SIG_THRESH = self.SIGNIFICANT_THRESHOLD
+        for row in self.sqlToInstances[sql]:
+            for count in row["counts"]:
+                if count >= SIG_THRESH:
+                    self.sqlToSignificant[sql] = row
+                    return True
+
+        return False
+
+    def getRepresentativeCounts(self, sql):
+        '''
+        Pick or synthesize a representative count set.  Currently that means
+        just pick the first (significant) one...
+
+        Only call this if hasStats/hasSignificantStats returned true for sql.
+        '''
+        if sql in self.sqlToSignificant:
+            return self.sqlToSignificant[sql]["counts"]
+
+        return self.sqlToInstances[sql][0]["counts"]
+
 class CmdLine(object):
     usage = '''usage: %prog [options] explained.json/explained.txt
 
@@ -1255,6 +1352,15 @@ class CmdLine(object):
                           action='store_true', dest='verbose', default=False,
                           help='Output a lot of info about what we are doing.')
 
+        parser.add_option('--vdbe-stats',
+                          dest='statsfile', default=None,
+                          help='JSON vdbe stats file to process')
+
+        parser.add_option('-a', '--all',
+                          action='store_true', dest='all', default=False,
+                          help=('Output data for everything, not just ' +
+                            'concerning data points.'))
+
         parser.add_option('-o', '--output-dir',
                           dest='out_dir', default=None,
                           help='Directory to output results in.')
@@ -1262,10 +1368,14 @@ class CmdLine(object):
                           action='store_true', dest='dataflow', default=False,
                           help='Output dataflow overview.')
 
+        parser.add_option('--no-png',
+                          action='store_false', dest='make_pngs', default=True,
+                          help='Do not automatically create png files.')
+
         return parser
     
     def run(self):
-        global DEBUG, NO_YIELDS, VERBOSE
+        global DEBUG, NO_YIELDS, VERBOSE, HAVE_COUNTS
 
         parser = self.buildParser()
         options, args = parser.parse_args()
@@ -1274,10 +1384,20 @@ class CmdLine(object):
         NO_YIELDS = not options.yields
         VERBOSE = options.verbose
 
+        # create the output directory if it doesn't already exist
         if options.out_dir:
             if not os.path.exists(options.out_dir):
                 os.mkdir(options.out_dir)
-
+        
+        # load the VDBE stats if available
+        if options.statsfile:
+            vdbestats = VdbeStats()
+            vdbestats.parseJsonStats(options.statsfile)
+            HAVE_COUNTS = True
+        else:
+            vdbestats = None
+            HAVE_COUNTS = False
+        
         for filename in args:
             if filename.endswith('.json'):
                 import json
@@ -1286,15 +1406,35 @@ class CmdLine(object):
                 f.close()
 
                 for iQuery, query in enumerate(obj["queries"]):
+                    # figure out whether to bother with this dude...
+                    sql = query["sql"]
+                    if vdbestats and not options.all:
+                        # we care about big fish, skip if it's not.
+                        if not vdbestats.hasSignificantStats(sql):
+                            continue
+                        counts = vdbestats.getRepresentativeCounts(sql)
+                    else:
+                        counts = None
+
                     print 'PROCESSING', query["sql"]
                     eg = ExplainGrokker()
-                    eg.parseJsonOpcodesList(query["operations"])
+                    eg.parseJsonOpcodesList(query["operations"],
+                                            counts=counts)
                     eg.performFlow()
                     
                     if options.out_dir:
                         blockpath = os.path.join(options.out_dir,
                                                  '%d-blocks.dot' % (iQuery,))
                         eg.diagBasicBlocks(blockpath)
+
+                        if options.make_pngs:
+                            pngpath = os.path.join(options.out_dir,
+                                                   '%d-blocks.png' % (iQuery,))
+                            import subprocess
+                            subprocess.check_call([
+                                "/usr/bin/dot", "-Tpng",
+                                "-o", pngpath,
+                                blockpath])
 
                     if options.out_dir and options.dataflow:
                         flowpath = os.path.join(options.out_dir,
@@ -1306,23 +1446,5 @@ class CmdLine(object):
 
 
 if __name__ == '__main__':
-
     cmdline = CmdLine()
     cmdline.run()
-    
-    import sys
-    sys.exit(0)
-
-    sg = SchemaGrokker()
-    sf = open('/tmp/schemainfo.txt')
-    sg.grok(sf)
-    sf.close()
-
-    eg = ExplainGrokker()
-    f = open('/tmp/explained.txt')
-    eg.grok(f, sg)
-    eg.dump()
-    f.close()
-
-    eg.diagBasicBlocks('/tmp/blocks.dot')
-    eg.diagDataFlow('/tmp/dataflow.dot')
