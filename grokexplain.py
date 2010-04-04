@@ -221,6 +221,11 @@ class RegStates(object):
         s = ''
         for reg, values in self.regValues.items():
             s += ' r%s: %s' % (reg, values)
+
+        if HAVE_COUNTS:
+            s = "<tr><td align='left'>%s</td><td></td><td></td></tr>" % (s,)
+        else:
+            s = "<tr><td align='left'>%s</td></tr>" % (s,)
         return s
 
 class BasicBlock(object):
@@ -306,6 +311,8 @@ class GenericOpInfo(object):
 
         #: (potentially normalized) number of times opcode invoked
         self.invocCount = None
+        #: (potentially normalized) number of btree pages accessed
+        self.pageCount = None
 
         self.affectedByCursors = set()
 
@@ -326,28 +333,33 @@ class GenericOpInfo(object):
     HIGHLIGHT_OPS = {'Yield': '#ff00ff',
                      'Gosub': '#ff00ff',
                      'Return': '#ff00ff'}
+    INVOC_THRESHOLDS = [0, 1, 2, 10, 100, 1000]
+    PAGE_THRESHOLDS = [0, 1, 2, 8, 64, 256]
     def graphStr(self, schemaInfo):
-        if HAVE_COUNTS:
-            count = self.invocCount or 0
-            if count == 0:
-                s = "<font color='#ffffff'>||||| </font>"
-            elif count == 1:
-                s = ("<font color='#4aba4a'>|</font>" +
-                     "<font color='#ffffff'>|||| </font>")
-            elif count == 2:
-                s = ("<font color='#119125'>|</font>" +
-                     "<font color='#ffffff'>|||| </font>")
-            elif count <= 10:
-                s = ("<font color='#119125'>||</font>" +
-                     "<font color='#ffffff'>||| </font>")
-            elif count <= 100:
-                s = ("<font color='#f5eb33'>|||</font>" +
-                     "<font color='#ffffff'>|| </font>")
-            elif count <= 1000:
-                s = ("<font color='#ad1316'>||||</font>" +
-                     "<font color='#ffffff'>| </font>")
+        def bar(count, thresholds):
+            if count == thresholds[0]:
+                return "<font color='#ffffff'>||||| </font>"
+            elif count == thresholds[1]:
+                return ("<font color='#4aba4a'>|</font>" +
+                        "<font color='#ffffff'>|||| </font>")
+            elif count == thresholds[2]:
+                return ("<font color='#119125'>|</font>" +
+                        "<font color='#ffffff'>|||| </font>")
+            elif count <= thresholds[3]:
+                return ("<font color='#119125'>||</font>" +
+                        "<font color='#ffffff'>||| </font>")
+            elif count <= thresholds[4]:
+                return ("<font color='#cccf3c'>|||</font>" +
+                        "<font color='#ffffff'>|| </font>")
+            elif count <= thresholds[5]:
+                return ("<font color='#ad1316'>||||</font>" +
+                        "<font color='#ffffff'>| </font>")
             else:
-                s = "<font color='#ad1316'>||||| </font>"
+                return "<font color='#ad1316'>||||| </font>"
+
+        if HAVE_COUNTS:
+            s = bar(self.invocCount or 0, self.INVOC_THRESHOLDS)
+            s += bar(self.pageCount or 0, self.PAGE_THRESHOLDS)
         else:
             s = ''
 
@@ -396,6 +408,13 @@ class GenericOpInfo(object):
 
         if self.comment:
             s += " <font color='#888888'>%s</font>" % (self.comment,)
+
+        if HAVE_COUNTS:
+            s = ("<tr><td align='left'>%s</td>" +
+                 "    <td align='left'>%d</td><td>%d</td></tr>") % (
+                s, self.invocCount or 0, self.pageCount or 0)
+        else:
+            s = "<tr><td align='left'>%s</td></tr>" % (s,)
 
         return s
 
@@ -959,7 +978,7 @@ class ExplainGrokker(object):
                 print 'Ignoring opcode', opcode
 
     
-    def parseJsonOpcodesList(self, opcodeList, counts=None):
+    def parseJsonOpcodesList(self, opcodeList, counts=None, pages=None):
         '''
         Process a python list where each entry in the list is itself a list
         representing a row of EXPLAIN output.  The columns are then:
@@ -969,6 +988,9 @@ class ExplainGrokker(object):
         In a SQLite build built with -DDEBUG, the comment will be the name of
         the column where appropriate.  This eliminates the need to have
         metadata available.
+
+        @param counts A list of invocation counts (index is opcode addr)
+        @param pages A list of btree page access counts (index is opcode addr)
         '''
         self.schemaInfo = SchemaGrokker()
 
@@ -993,6 +1015,8 @@ class ExplainGrokker(object):
             # if we have a count for this opcode, set it
             if counts and len(counts) > addr:
                 self.op.invocCount = counts[addr]
+            if pages and len(pages) > addr:
+                self.op.pageCount = pages[addr]
 
             handler = getattr(self, "_op_" + opcode, None)
             if handler:
@@ -1077,24 +1101,28 @@ class ExplainGrokker(object):
         buf = f.read()
         #buf = buf.replace('\\\n>', '>\\\n').replace('\\\n"', '"\\\n')
         buf = buf.replace('\\\n', '')
-        buf = buf.replace('"<<', '<').replace('>>"', '>').replace('\\n', '<br align="left"/>')
+        buf = buf.replace('"<<', '<').replace('>>"', '>')
         buf = buf.replace('\\\\\nn', '\\\n<br align="left"/>')
         f.close()
         f = open(outpath, 'w')
         f.write(buf)
         f.close()
 
-    def diagBasicBlocks(self, outpath):
+    BB_TABLE_HEADER = "<TABLE BORDER='0' CELLBORDER='0' CELLSPACING='0'>"
+    BB_TABLE_FOOTER = "</TABLE>"
+    def diagBasicBlocks(self, outpath, sqlStr):
         self.colorCursors()
+
 
         g = pygraphviz.AGraph(directed=True, strict=False)
         for block in self.basicBlocks.values():
-            ltext = ("<<" +
-              (DEBUG and (block.inRegs.graphStr() + '\\n') or '') +
-              '\\n'.join(
+            ltext = ("<< " + self.BB_TABLE_HEADER +
+              (DEBUG and (block.inRegs.graphStr()) or '') +
+              ''.join(
                 [op.graphStr(self.schemaInfo) for op in block.ops]) +
-              (DEBUG and ('\\n' + block.outRegs.graphStr()) or '') +
-              "\\n>>")
+              (DEBUG and (block.outRegs.graphStr()) or '') +
+              self.BB_TABLE_FOOTER +
+              " >>")
             g.add_node(block.id, label=str(ltext))
 
         for block in self.basicBlocks.values():
@@ -1107,6 +1135,8 @@ class ExplainGrokker(object):
                     attrs['color'] = 'gray'
                 g.add_edge(block.id, target_block.id, **attrs)
 
+        g.graph_attr['label'] = str(sqlStr) # hates unicode
+        g.graph_attr['labelloc'] = 't' # top
         g.node_attr['shape'] = 'box'
         g.node_attr['fontsize'] = '8'
 
@@ -1266,12 +1296,13 @@ class ExplainGrokker(object):
 
 class VdbeStats(object):
     '''
-    Process output from sqlite-perf.stp.  It emits a data structure with the
+    Process output from sqlite-perf.stp which emits a data structure with the
     following form:
     {
       "stats": [
         {"sql": "SQL STRING, possibly <unknown>",
-         "counts": [1,1,1,5,5,2,1]
+         "counts": [1,1,1,5,5,2,1],
+         "pages": [0,0,1,4]
         },
         ...
       ]
@@ -1327,9 +1358,10 @@ class VdbeStats(object):
         Only call this if hasStats/hasSignificantStats returned true for sql.
         '''
         if sql in self.sqlToSignificant:
-            return self.sqlToSignificant[sql]["counts"]
+            return self.sqlToSignificant[sql]
 
-        return self.sqlToInstances[sql][0]["counts"]
+        return self.sqlToInstances[sql][0]
+
 
 class CmdLine(object):
     usage = '''usage: %prog [options] explained.json/explained.txt
@@ -1356,10 +1388,15 @@ class CmdLine(object):
                           dest='statsfile', default=None,
                           help='JSON vdbe stats file to process')
 
+        # decision-making on what to output
         parser.add_option('-a', '--all',
                           action='store_true', dest='all', default=False,
                           help=('Output data for everything, not just ' +
                             'concerning data points.'))
+        parser.add_option('-m', '--match',
+                          dest='match_substring', default=None,
+                          help=('Substring to match in queries to determine ' +
+                            'whether to output for a query.'))
 
         parser.add_option('-o', '--output-dir',
                           dest='out_dir', default=None,
@@ -1406,26 +1443,40 @@ class CmdLine(object):
                 f.close()
 
                 for iQuery, query in enumerate(obj["queries"]):
-                    # figure out whether to bother with this dude...
                     sql = query["sql"]
-                    if vdbestats and not options.all:
-                        # we care about big fish, skip if it's not.
-                        if not vdbestats.hasSignificantStats(sql):
-                            continue
-                        counts = vdbestats.getRepresentativeCounts(sql)
+                    # figure out whether this 'matches' the display rules
+                    if options.all:
+                        matches = True
+                    elif options.match_substring:
+                        matches = options.match_substring.lower() in sql.lower()
+                    elif vdbestats:
+                        matches = vdbestats.hasSignificantStats(sql)
+                    else:
+                        matches = False
+
+                    if not matches:
+                        continue
+
+                    if vdbestats:
+                        row = vdbestats.getRepresentativeCounts(sql)
+                        counts = row["counts"]
+                        pages = row["pages"]
+                    elif not matches:
+                        continue
                     else:
                         counts = None
+                        pages = None
 
                     print 'PROCESSING', query["sql"]
                     eg = ExplainGrokker()
                     eg.parseJsonOpcodesList(query["operations"],
-                                            counts=counts)
+                                            counts=counts, pages=pages)
                     eg.performFlow()
                     
                     if options.out_dir:
                         blockpath = os.path.join(options.out_dir,
                                                  '%d-blocks.dot' % (iQuery,))
-                        eg.diagBasicBlocks(blockpath)
+                        eg.diagBasicBlocks(blockpath, sql)
 
                         if options.make_pngs:
                             pngpath = os.path.join(options.out_dir,
