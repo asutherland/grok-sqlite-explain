@@ -7,7 +7,7 @@
 
 import pygraphviz
 import cStringIO as StringIO
-import os, os.path
+import os, os.path, textwrap
 import optparse
 
 class TableSchema(object):
@@ -570,11 +570,20 @@ class ExplainGrokker(object):
         self._op_OpenCommon(params, True)
 
     def _op_OpenPseudo(self, params):
+        # a psuedo-table is a 'fake table with a single row of data'
+        # cursor is P1
+        # the pseudo-table is stored into a blob in P2
+        # number of fields/columns is p3
+        # XXX our Column opcode might benefit from being aware that it's dealing
+        #  with a cursor to a psuedo table so that it can translate its actions
+        #  into actions on the underlying register too.  but we no longer really
+        #  care about that so much these days.
         cursorNum = params[0]
         table = self._newPseudoTable(
             name=("pseudo%d" % (cursorNum,)),
-            columns=self.nextOpInfo)
-        self._newCursor(cursorNum, table, copy=params[1]==0)
+            columns=params[2])
+        self._newCursor(cursorNum, table)
+        self.op.regWrites.append(params[1])
 
     def _op_VOpen(self, params):
         # p1: cursor number
@@ -918,6 +927,33 @@ class ExplainGrokker(object):
         # halts if reg[P3] is null.
         self.op.regReads.append(params[2])
 
+    def _mathCommon(self, params):
+        # inputs P1 and P2, outputs P3
+        self.op.regReads.extend([params[0], params[1]])
+        self.op.regWrites.append(params[2])
+    def _op_Add(self, params):
+        self._mathCommon(params)
+    def _op_Multiply(self, params):
+        self._mathCommon(params)
+    def _op_Subtract(self, params):
+        self._mathCommon(params)
+    def _op_Divide(self, params):
+        self._mathCommon(params)
+    def _op_Remainder(self, params):
+        self._mathCommon(params)
+
+    def _op_Function(self, params):
+        # P1 is a bitmask indicating where each arg is constant (when set)
+        self.op.regReads.append(params[0])
+        # args are P2..P2+P5-1
+        self.op.regReads.extend(
+            [params[1] + x for x in range(int(params[4], 10))])
+        # result stored in P3
+        self.op.regWrites.append(params[2])
+        # P4 is the function pointer which ends up a nice string for us
+        # transfer the function pointer string to the comment.
+        self.op.comment = params[3]
+
     def _op_VerifyCookie(self, params):
         # schema delta check.  no one cares.
         pass
@@ -1135,7 +1171,8 @@ class ExplainGrokker(object):
                     attrs['color'] = 'gray'
                 g.add_edge(block.id, target_block.id, **attrs)
 
-        g.graph_attr['label'] = str(sqlStr) # hates unicode
+        # wrap and de-unicode (which our graphviz lib hates)
+        g.graph_attr['label'] = '\\n'.join(textwrap.wrap(str(sqlStr), 80))
         g.graph_attr['labelloc'] = 't' # top
         g.node_attr['shape'] = 'box'
         g.node_attr['fontsize'] = '8'
