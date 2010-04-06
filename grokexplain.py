@@ -913,6 +913,10 @@ class ExplainGrokker(object):
         self.op.regWrites.append(params[1])
         self.op.usesImmediate = params[3]
 
+    def _op_Real(self, params):
+        self.op.regWrites.append(params[1])
+        self.op.usesImmediate = params[3]
+
     def _op_Blob(self, params):
         self.op.regWrites.append(params[1])
         self.op.usesImmediate = '(blob)'
