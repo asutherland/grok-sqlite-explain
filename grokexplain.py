@@ -1151,18 +1151,21 @@ class ExplainGrokker(object):
     BB_TABLE_HEADER = "<TABLE BORDER='0' CELLBORDER='0' CELLSPACING='0'>"
     BB_TABLE_FOOTER = "</TABLE>"
     def diagBasicBlocks(self, outpath, sqlStr):
+        '''
+        Diagram the basic blocks, putting the sqlStr up in the header.
+        '''
         self.colorCursors()
 
 
         g = pygraphviz.AGraph(directed=True, strict=False)
         for block in self.basicBlocks.values():
-            ltext = ("<< " + self.BB_TABLE_HEADER +
+            ltext = ("< " + self.BB_TABLE_HEADER +
               (DEBUG and (block.inRegs.graphStr()) or '') +
               ''.join(
                 [op.graphStr(self.schemaInfo) for op in block.ops]) +
               (DEBUG and (block.outRegs.graphStr()) or '') +
               self.BB_TABLE_FOOTER +
-              " >>")
+              " >")
             g.add_node(block.id, label=str(ltext))
 
         for block in self.basicBlocks.values():
@@ -1532,8 +1535,36 @@ class CmdLine(object):
                         flowpath = os.path.join(options.out_dir,
                                                 '%d-flow.dot' % (iQuery,))
                         eg.diagDataFlow(flowpath)
+            elif filename.endswith('.txt'):
+                eg = ExplainGrokker()
+                f = open(filename, 'rt')
+                # XXX hook up external schema output parse again?
+                eg.parseExplainTextFile(f)
+                f.close()
+                eg.performFlow()
 
+                basename = os.path.splitext(os.path.basename(filename))[0]
 
+                if options.out_dir:
+                    blockpath = os.path.join(options.out_dir,
+                                             '%s-blocks.dot' % (basename,))
+                    eg.diagBasicBlocks(blockpath, "...")
+
+                    if options.make_pngs:
+                        pngpath = os.path.join(options.out_dir,
+                                               '%s-blocks.png' % (basename,))
+                        import subprocess
+                        subprocess.check_call([
+                            "/usr/bin/dot", "-Tpng",
+                            "-o", pngpath,
+                            blockpath])
+
+                if options.out_dir and options.dataflow:
+                    flowpath = os.path.join(options.out_dir,
+                                            '%s-flow.dot' % (basename,))
+                    eg.diagDataFlow(flowpath)
+            else:
+                print 'Input filename needs to end with .json or .txt!'
         
 
 
