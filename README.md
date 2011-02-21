@@ -3,8 +3,7 @@
 It takes SQLite explanations and visualizes them.  If you have performance data
 in the form of I/O counts and opcode execution counts, it can also show those.
 
-See:
-http://www.visophyte.org/blog/2010/04/06/performance-annotated-sqlite-explaination-visualizations-using-systemtap/
+See [this blog post](http://www.visophyte.org/blog/2010/04/06/performance-annotated-sqlite-explaination-visualizations-using-systemtap/).
 
 # What ingredients are required?
 
