@@ -9,6 +9,7 @@ import pygraphviz
 import cStringIO as StringIO
 import os, os.path, textwrap
 import optparse
+from cgi import escape as escapeHTML
 
 class TableSchema(object):
     '''
@@ -369,9 +370,10 @@ class GenericOpInfo(object):
                  self.usesCursor.handle)
         elif self.name in self.HIGHLIGHT_OPS:
             s += "%d <font color='%s'>%s</font>" % (
-                 self.addr, self.HIGHLIGHT_OPS[self.name], self.name)
+                 self.addr, self.HIGHLIGHT_OPS[self.name],
+                 escapeHTML(self.name))
         else:
-            s += '%d %s' % (self.addr, self.name)
+            s += '%d %s' % (self.addr, escapeHTML(self.name))
 
         if self.affectedByCursors:
             cursors = list(self.affectedByCursors)
@@ -388,7 +390,7 @@ class GenericOpInfo(object):
 
         if self.usesCursor and self.births:
             if self.usesCursor in self.births and self.usesCursor.on:
-                s += ' %s' % (self.usesCursor.on.name,)
+                s += ' %s' % (escapeHTML(self.usesCursor.on.name),)
 
         if self.usesImmediate is not None:
             s += ' imm %s' % (self.usesImmediate)
@@ -398,7 +400,7 @@ class GenericOpInfo(object):
             if schema:
                 colNames = []
                 for colNum in self.usesColumns:
-                    colNames.append(schema.columns[colNum])
+                    colNames.append(escapeHTML(schema.columns[colNum]))
                 s += ' col %s' % (', '.join(colNames))
 
         if self.regReads:
@@ -407,7 +409,8 @@ class GenericOpInfo(object):
             s += ' to r%s' % (', r'.join(map(str, self.regWrites)),)
 
         if self.comment:
-            s += " <font color='#888888'>%s</font>" % (self.comment,)
+            s += " <font color='#888888'>%s</font>" % (escapeHTML(self.comment),
+                                                       )
 
         if HAVE_COUNTS:
             s = ("<tr><td align='left'>%s</td>" +
