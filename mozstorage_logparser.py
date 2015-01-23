@@ -34,14 +34,19 @@
 #
 # We define the following named types of these entries:
 # - open: connection opened. { filename, conn }
-# - close: connection closed. { filename }
-# - init: statement initialized. { async, sql, stmt } where sql has the
+# - close: connection closed. { filename, conn }
+# - init: statement initialized. { async, sql, conn, stmt } where sql has the
 #   parameter placeholders intact.
+# - initAsync: the sqlite3_stmt created for an async mozStorage statement.
+#   { sql, conn, stmt, native }
 # - exec: statement executed (sqlite3_trace). { sql, conn } where sql has the
 #   parameter placeholders replaced with the values.
-# - reset: statement reset. { sql } where sql has the parameter placeholders
+# - profile: statement execution completed (sqlite3_profile) { sql, conn,
+#   durationMS }.
+# - reset: statement reset and bindings cleared.  Only present in DEBUG builds.
+#   { sql, conn, stmt } where sql has the parameter placeholders
 #   intact.
-# - finalize: statement finalized. { sql, gc }
+# - finalize: statement finalized. { sql, gc, conn, stmt }
 # 
 # 
 # ## Meta ##
@@ -58,6 +63,8 @@ import calendar, time
 from datetime import datetime
 import os, os.path
 import re
+
+from collections import OrderedDict
 
 import json
 import optparse
@@ -119,29 +126,43 @@ def unwrap_nspr_log_lines(lineGen):
 
 
 # Opening connection to 'places.sqlite' (7f39931861a0)
-RE_OPEN = re.compile("^Opening connection to '(.+)' \(([0-9a-fA-F]+)\)$")
+RE_OPEN = re.compile("^Opening connection to '(.+)' \(0x([0-9a-fA-F]+)\)$")
 # Closing connection to 'cookies.sqlite'
-RE_CLOSE = re.compile("^Closing connection to '(.+)'$")
+RE_CLOSE = re.compile("^Closing connection to '(.+)' \(0x([0-9a-fA-F]+)\)$")
 # Initialized statement 'SOME SQL WITH PARAMETER PLACEHOLDERS' (0x7f398ea28b20)
 # NOTE! the pointer is the statement pointer, not the connection id!
-RE_INIT = re.compile("^Initialized statement '(.+)' \(0x([0-9a-fA-F]+)\)$",
+RE_INIT = re.compile("^(Initialized|Inited async) statement '(.+)' \(conn 0x([0-9a-fA-F]+) stmt 0x([0-9a-fA-F]+)\)$",
                      re.DOTALL)
-# Inited async statement 'SOME SQL' (0x7ffff9de14f8)
-# NOTE! the pointer is the statement pointer, not the connection id!
-RE_INITASYNC = re.compile("^Inited async statement '(.+)' " +
-                          "\(0x([0-9a-fA-F]+)\)$",
-                          re.DOTALL)
 # sqlite3_trace on 7f399f719fe0 for 'SOME SQL WITH PARAMETERS FILLED'
-RE_EXEC = re.compile("^sqlite3_trace on ([0-9a-fA-F]+) for '(.+)'$",
+RE_EXEC = re.compile("^sqlite3_trace on conn 0x([0-9a-fA-F]+) for '(.+)'$",
                      re.DOTALL)
+RE_PROFILE = re.compile(
+    "^sqlite3_profile on conn 0x([0-9a-fA-F]+) duration (\d+) for '(.+)'$",
+    re.DOTALL)
 # Resetting statement: 'SOME SQL WITH PARAMETER PLACEHOLDERS'
-RE_RESET = re.compile("^Resetting statement: '(.+)'$",
+RE_RESET = re.compile("^Resetting statement: '(.+)' " +
+                      "\(conn 0x([0-9a-fA-F]+) stmt 0x([0-9a-fA-F]+)\)$",
                       re.DOTALL)
 # Finalizing statement 'SOME SQL W/PLACEHOLDERS'
 # Finalizing statement 'SOME SQL W/PLACEHOLDERS' during garbage-collection
-RE_FINALIZE = re.compile("^Finalizing statement '(.+)'" +
-                         "( during garbage-collection)?$",
-                         re.DOTALL)
+# Auto-finalizing SQL statement '...' (conn %p stmt %p)
+RE_FINALIZE = re.compile(
+  "^(?:Finalizing|Auto-finalizing) (async )?statement '(.+)'" +
+  "( during garbage-collection)? " +
+  "\(conn 0x([0-9a-fA-F]+) stmt 0x([0-9a-fA-F]+)\)$",
+  re.DOTALL)
+
+# Native async statement (conn %p stm %p) initialized '...' as %p
+RE_NATIVE_ASYNC = re.compile(
+  "^Native async statement \(conn 0x([0-9a-fA-F]+) stmt 0x([0-9a-fA-F]+)\)" +
+  " initialized '(.+)' as 0x([0-9a-fA-F]+)$",
+  re.DOTALL)
+
+# !!! I haven't implemented parsing for these yet (not seeing them in usage):
+# Vacuum failed with error: %d '%s'. Database was: '%s'
+# Compilation failure: '...' could not be compiled due to an error: ...
+# Cloned statement (conn %p stmt %p) to async native %p
+
 class StorageLogParser(object):
     '''
     Generator style low-level parser.
@@ -149,11 +170,9 @@ class StorageLogParser(object):
     def parse(self, f):
         for ts, tid, msg in unwrap_nspr_log_lines(coalesce_indented_lines(f)):
             firstWord = msg[:msg.find(' ')]
-            d = {
-                'ts': ts,
-                'tid': tid,
-                #'raw': msg
-            }
+            d = OrderedDict()
+            d['ts'] = ts
+            d['tid'] = tid
             if firstWord == 'Opening':
                 m = RE_OPEN.match(msg)
                 if not m:
@@ -173,7 +192,8 @@ class StorageLogParser(object):
                 else:
                     d['type'] = 'close'
                     d['filename'] = m.group(1)
-            elif firstWord == 'Initialized':
+                    d['conn'] = m.group(2)
+            elif firstWord == 'Initialized' or firstWord == 'Inited':
                 m = RE_INIT.match(msg)
                 if not m:
                     d['type'] = 'bad'
@@ -181,20 +201,22 @@ class StorageLogParser(object):
                         print 'Sad init msg:', msg
                 else:
                     d['type'] = 'init'
-                    d['async'] = False
-                    d['sql'] = m.group(1)
-                    d['stmt'] = m.group(2)
-            elif firstWord == 'Inited':
-                m = RE_INITASYNC.match(msg)
+                    d['async'] = m.group(1) != 'Initaizlied'
+                    d['sql'] = m.group(2)
+                    d['conn'] = m.group(3)
+                    d['stmt'] = m.group(4)
+            elif firstWord == 'Native':
+                m = RE_NATIVE_ASYNC.match(msg)
                 if not m:
                     d['type'] = 'bad'
                     if VERBOSE:
-                        print 'Sad initasync msg:', msg
+                        print 'Sad async native init msg:', msg
                 else:
-                    d['type'] = 'init'
-                    d['async'] = True
-                    d['sql'] = m.group(1)
+                    d['type'] = 'asyncNative'
+                    d['sql'] = m.group(3)
+                    d['conn'] = m.group(1)
                     d['stmt'] = m.group(2)
+                    d['native'] = m.group(4)
             elif firstWord == 'sqlite3_trace':
                 m = RE_EXEC.match(msg)
                 if not m:
@@ -205,6 +227,17 @@ class StorageLogParser(object):
                     d['type'] = 'exec'
                     d['sql'] = m.group(2)
                     d['conn'] = m.group(1)
+            elif firstWord == 'sqlite3_profile':
+                m = RE_PROFILE.match(msg)
+                if not m:
+                    d['type'] = 'bad'
+                    if VERBOSE:
+                        print 'Sad exec msg:', msg
+                else:
+                    d['type'] = 'profile'
+                    d['sql'] = m.group(3)
+                    d['conn'] = m.group(1)
+                    d['durationMS'] = float(m.group(2)) / 1000000.0
             elif firstWord == 'Resetting':
                 m = RE_RESET.match(msg)
                 if not m:
@@ -214,7 +247,9 @@ class StorageLogParser(object):
                 else:
                     d['type'] = 'reset'
                     d['sql'] = m.group(1)
-            elif firstWord == 'Finalizing':
+                    d['conn'] = m.group(2)
+                    d['stmt'] = m.group(3)
+            elif firstWord == 'Finalizing' or firstWord == 'Auto-finalizing':
                 m = RE_FINALIZE.match(msg)
                 if not m:
                     d['type'] = 'bad'
@@ -222,8 +257,10 @@ class StorageLogParser(object):
                         print 'Sad finalize msg:', repr(msg)
                 else:
                     d['type'] = 'finalize'
-                    d['sql'] = m.group(1)
-                    d['gc'] = m.group(2) and True or False
+                    d['conn'] = m.group(4)
+                    d['stmt'] = m.group(5)
+                    d['sql'] = m.group(2)
+                    d['gc'] = m.group(3) and True or False
             else:
                 d['type'] = 'unknown'
                 if VERBOSE:
@@ -244,39 +281,34 @@ def normalize_param_sql(sql):
 
 class StorageLogChewer(object):
     def __init__(self):
-        # Maps connection id's (the hex pointer strings) to our connection
-        # aggregate.
-        self.conns_by_id = {}
-        self.connIds_by_filename = {}
+        # all connection sessions
+        self.conn_sessions = []
 
     def chew(self, parseGen):
         '''
-        Consume a StorageLogParser's generator, deriving accumulated data and
-        all that.
+        Consume a StorageLogParser's generator, aggregating information by
+        connection pointer at the top level and summarizing executed statements
+        within that.
 
-        Our life is made complicated by the log strings only sometimes including
-        connection info and SQL sometimes having parameters filled in and
-        sometimes not.  Luckily for us, most statement usage should usually
-        take the form of "exec" followed by "reset", and as long as that holds
-        we should have the connection id as well as the SQL with parameters
-        filled in and without parameters filled in.  As long as we key off of
-        things by thread, this is almost certainly going to hold.  The only
-        complicating factor is sub-tasks (unsure if that means subselects or
-        just virtual table side-effects right now) per the docs; but that does
-        mean that we may need a limited similarity check between the SQL; like
-        comparing the string up through the first binding character (?/:).
-        
-        An important note there is that sqlite3_trace/exec fires at the start
-        of execution, sqlite3_profile would fire at the end, 
+        The most useful thing we do is (within a connection), we aggregate
+        statements based on their unbound SQL.  We then hang the specific bound
+        SQL executions off of that.  We can use the bound SQL for EXPLAINing
+        without going crazy explaining a ton of things.  (Noting that if ANALYZE
+        is used so the optimizer has more to go on, it may be appropriate to
+        EXPLAIN everything and de-duplicate its output.)
+
+        NOTE: Our "unique" values are pointers, which can inherently be reused
+        once their lifecycle is over.
         '''
-        conns_by_id = self.conns_by_id
-        connIds_by_filename = self.connIds_by_filename
-
-        # this maps threads to a list of active 'exec' tasks that have not yet
-        # been reset.  We match on first-come-first-serve normalized SQL
-        # startswith checks.  This is a pre-emptive attempt to deal with nested
-        # SQL stuff.
-        active_statements_by_threads = {}
+        # Maps live/active connection id's (the hex pointer strings) to our
+        # connection info aggregate.  (see make_conn_info)
+        conns_by_id = {}
+        # Map connection ids to a list of presumed actively executing
+        # statements.  Statements get added by 'exec' and removed by 'profile'.
+        # We use a list because virtual tables (and maybe other things?) mean
+        # that we can potentially have multiple SQL statements "in flight" on
+        # a connection at the same time.
+        active_statements_by_conn = {}
 
         def find_active_statement_by_param_sql(actives, param_sql):
             norm_sql = normalize_param_sql(param_sql)
@@ -291,61 +323,58 @@ class StorageLogChewer(object):
 
         def make_conn_info(connId, filename, d):
             '''helper that exists because we have to infer memory dbs'''
-            cinfo = conns_by_id[connId] = {
-                'filename': filename,
-                'id': connId,
-                'entries': [d],
-                'execs': [],
-                'uniqueExecs': {}
-            }
+            cinfo = conns_by_id[connId] = OrderedDict()
+            cinfo['filename'] = filename
+            cinfo['id'] = connId
+            # all logged entries for this conn.
+            cinfo['entries'] = []
+            cinfo['execs'] = []
+            cinfo['uniqueExecs'] = {}
+            self.conn_sessions.append(cinfo)
             return cinfo
 
         for d in parseGen:
             dtype = d['type']
-            
-            if dtype == 'open':
-                connId = d['conn']
-                filename = d['filename']
-                # so, connId's can apparently get reused or reported twice or
-                # something weird... so only create as needed
+
+            connId = d.get('conn')
+            if connId:
                 cinfo = conns_by_id.get(connId)
                 if cinfo is None:
-                    cinfo = make_conn_info(connId, filename, d)
-                connsForFilename = connIds_by_filename.setdefault(filename, [])
-                connsForFilename.append(connId)
-            elif dtype == 'close':
-                # Because we only have the filename and not the path and no
-                # connection info, this is basically useless.  So do nothing.
-                # Although we could alternately put this on every connection
-                # with the same name...
+                    cinfo = make_conn_info(connId, d['filename'], d)
+                cinfo['entries'].append(d)
+            else:
+                connId = None
+                cinfo = None
+            
+            if dtype == 'open':
+                # Nothing interesting to do for open since we're already
+                # implicitly doing everything.
                 pass
+            elif dtype == 'close':
+                # It's no longer alive after this!  (Although it wouldn't
+                # be surprising for complicated threading/life-cycle things
+                # to result in some spurious re-inferring of a live connection.
+                del conns_by_id[connId]
             elif dtype == 'init':
                 # The init pointer is describing the pointer of the statement
                 # right now, so this is entirely useless.  We can improve things
                 # by fixing the mozStorage logging.
                 pass
             elif dtype == 'exec':
-                connId = d['conn']
-                tid = d['tid']
-                cinfo = conns_by_id[connId]
-                entries = cinfo['entries']
-                entries.append(d)
-
-                active_statements = active_statements_by_threads.get(tid)
+                # exec/profile are keyed only by connection
+                active_statements = active_statements_by_conn.get(connId)
                 if active_statements is None:
-                    active_statements = active_statements_by_threads[tid] = []
+                    active_statements = active_statements_by_conn[connId] = []
                 active_statements.append(d)
                 # avoid unbounded growth of this tracking
                 if len(active_statements) > 10:
                     active_statements.pop(0)
-            # executeSimpleSQL doesn't reset, it goes straight to finalize, so
-            # we basically need to treat them the same for analysis purposes
-            elif dtype == 'reset' or dtype == 'finalize':
+            elif dtype == 'profile':
                 param_sql = d['sql']
-                active_statements = active_statements_by_threads.get(tid)
+                active_statements = active_statements_by_conn.get(connId)
                 if active_statements is None:
                     if VERBOSE:
-                        print 'unexpected reset on thread without actives', tid
+                        print 'Weird profile mismatch on conn', connId
                     continue
                 active = find_active_statement_by_param_sql(active_statements,
                                                             param_sql)
@@ -353,37 +382,34 @@ class StorageLogChewer(object):
                     # this is potentially quite likely, so no logging unless
                     # we want extreme logging
                     if PARANOIA:
-                        print 'reset without active', d
+                        print 'profile without active', d
                     continue
-                connId = active['conn']
-                cinfo = conns_by_id[connId]
-                # update entries
-                entries = cinfo['entries']
-                entries.append(d)
+                
                 # update the exec with info on this
                 execs = cinfo['execs']
-                execInfo = {
-                    'unboundSQL': param_sql,
-                    'boundSQL': active['sql'],
-                    'startTS': active['ts'],
-                    'endTS': d['ts']
-                }
+                execInfo = OrderedDict()
+                execInfo['unboundSQL'] = param_sql
+                execInfo['boundSQL'] = active['sql']
+                execInfo['startTS'] = active['ts']
+                execInfo['endTS'] = d['ts']
+                execInfo['durationMS'] = d['durationMS']
                 execs.append(execInfo)
                 # and the unique execs (this is what we use for EXPLAIN, mainly)
                 uniqueExecs = cinfo['uniqueExecs']
                 uniqueExec = uniqueExecs.get(param_sql)
                 if uniqueExec is None:
-                    uniqueExec = uniqueExecs[param_sql] = {
-                        'unboundSQL': param_sql,
-                        'execs': []
-                    }
-                uniqueExecInst = {
-                    'boundSQL': active['sql'],
-                    'startTS': active['ts'],
-                    'endTS': d['ts']
-                }
+                    uniqueExec = uniqueExecs[param_sql] = OrderedDict()
+                    uniqueExec['unboundSQL'] = param_sql
+                    uniqueExec['execs'] = []
+
+                uniqueExecInst = OrderedDict()
+                uniqueExecInst['boundSQL'] = active['sql']
+                uniqueExecInst['startTS'] = active['ts']
+                uniqueExecInst['endTS'] = d['ts']
+                uniqueExecInst['durationMS'] = d['durationMS']
+
                 uniqueExec['execs'].append(uniqueExecInst)
-        
+
 
 class CmdLine(object):
     usage = '''usage: %prog [options] mozStorage_nspr.log
@@ -435,7 +461,7 @@ class CmdLine(object):
             f = open(filename, 'rt')
             chewer.chew(parser.parse(f))
             f.close()
-            print json.dumps(chewer.conns_by_id, indent=2)
+            print json.dumps(chewer.conn_sessions, indent=2)
             
 
 if __name__ == '__main__':
