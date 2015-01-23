@@ -66,6 +66,8 @@ import os, os.path
 import re
 import subprocess
 
+import grokexplain
+
 import json
 import optparse
 
@@ -417,13 +419,28 @@ class StorageLogChewer(object):
 
                 uniqueExec['execs'].append(uniqueExecInst)
 
+def dump_db_schema(sqlite_path, db_path):
+    args = [
+        sqlite_path,
+        db_path,
+        '.schema'
+        ]
+    pope = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, shell=False)
+    pope.stdin.close()
+    lines = []
+    for line in pope.stdout:
+        lines.append(line)
+    stderr = pope.stderr.read()
+    return lines
+
 def run_explain(sqlite_path, db_path, sql):
     sanitized_sql = sql.replace('\n', ' ')
     args = [
         sqlite_path,
         '-separator', '<|>',
         db_path,
-        '-cmd', 'EXPLAIN ' + sanitized_sql,
+        'EXPLAIN ' + sanitized_sql,
         ]
     pope = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, shell=False)
@@ -432,26 +449,69 @@ def run_explain(sqlite_path, db_path, sql):
     for line in pope.stdout:
         rows.append(line.rstrip().split('<|>'))
     stderr = pope.stderr.read()
-    print 'EXPLAINED', sanitized_sql
-    print rows
+    return rows
 
 class ExplainProcessor(object):
+    '''
+    Process connection sessions to generate 
+    '''
     def __init__(self, conn_sessions, out_dir, db_path, sqlite_path):
         self.conn_sessions = conn_sessions
         self.out_dir = out_dir
         self.db_path = db_path
         self.sqlite_path = sqlite_path
+        
+        self.next_id = 1
+        self.explanations = []
+        self.already_explained = set()
 
-    def processSession(self, cinfo):
+    def processSession(self, cinfo, sg):
+        explanations = self.explanations
+        already_explained = self.already_explained
         for uexec in cinfo['uniqueExecs'].itervalues():
+            unbound_sql = uexec['unboundSQL']
+            if unbound_sql in already_explained:
+                continue
+            already_explained.add(unbound_sql)
+
             first_exec = uexec['execs'][0]
             first_bound_sql = first_exec['boundSQL']
-            run_explain(self.sqlite_path, self.db_path, first_bound_sql)
+            rows = run_explain(self.sqlite_path, self.db_path, first_bound_sql)
+
+            use_id = self.next_id
+            self.next_id += 1
+            explain_info = OrderedDict()
+            explain_info['id'] = use_id
+            explain_info['unboundSQL'] = unbound_sql
+            explain_info['usedBoundSQL'] = first_bound_sql
+            explain_info['rows'] = rows
+            explanations.append(explain_info)
+
+            eg = grokexplain.ExplainGrokker()
+            eg.parseExplainStringRows(rows, sg)
+            eg.performFlow()
+
+            # it's possible this was a super-boring thing, in which case we
+            # 
+
+            filename_prefix = 'blocks-%d' % (use_id,)
+            grokexplain.output_blocks(eg, first_bound_sql, self.out_dir,
+                                      filename_prefix)
+            explain_info['dot'] = filename_prefix + '.dot'
+            explain_info['png'] = filename_prefix + '.png'
+
+
 
     def processAll(self):
+        # Since we have the database available, we can automatically dump the
+        # schema.
+        sg = grokexplain.SchemaGrokker()
+        sg.grok(dump_db_schema(self.sqlite_path, self.db_path))
+
+        print repr(sg.tables)
+
         for session in self.conn_sessions:
-            self.processSession(session)
-        
+            self.processSession(session, sg)
 
 
 class CmdLine(object):
@@ -534,6 +594,10 @@ class CmdLine(object):
                 eproc = ExplainProcessor(conn_sessions, options.out_dir,
                                          db_path, sqlite_path)
                 eproc.processAll()
+                explained_path = os.path.join(options.out_dir, 'explained.json')
+                explained_file = open(explained_path, 'wt')
+                json.dump(eproc.explanations, explained_file, indent=2)
+                explained_file.close()
             else:
                 print json.dumps(conn_sessions, indent=2)
             

@@ -1,15 +1,18 @@
-# Attempt to understand what is happening in a SQLite EXPLAIN-ation.
-# Our primary concern is data-flow, not control flow.
+# Attempt to understand what is happening in a SQLite EXPLAIN-ation and
+# build a useful control-flow diagram.  (We can also do some data-flow
+# stuff, but it never really turned out to be too useful.)
+#
+# Info on the opcodes and what not can be found at:
+# http://www.sqlite.org/opcode.html
 #
 # Andrew Sutherland <asutherland@asutherland.org>
-# Mozilla Messaging, Inc.
-
 
 import pygraphviz
 import cStringIO as StringIO
 import os, os.path, textwrap
 import optparse
 from cgi import escape as escapeHTML
+import subprocess
 
 class TableSchema(object):
     '''
@@ -24,6 +27,11 @@ class SchemaGrokker(object):
     '''
     Parses a schema dump like "sqlite3 DATABASE .schema" outputs for info
     about tables and virtual tables.
+
+    Huh, so, it seems like we don't actually use this at the current time.
+    I think this was relevant originally, but once I discovered that the debug
+    build would include basically the same info in the comment column, it
+    became significantly less important.
     '''
     def __init__(self):
         self.tables = {}
@@ -33,9 +41,10 @@ class SchemaGrokker(object):
         for line in file_or_lines:
             if line.startswith('CREATE TABLE'):
                 name = line.split(' ')[2]
-                if '_' in name:
-                    # HACK virtual table fallout detection
-                    continue
+                # Not sure what the rationale was for this, but this is no good
+                #if '_' in name:
+                #    # HACK virtual table fallout detection
+                #    continue
 
                 insideParens = line[line.find('(')+1:line.rfind(';')-1]
                 columnNames = []
@@ -442,6 +451,7 @@ class ExplainGrokker(object):
         self.allTables = []
 
         self.indices = []
+        self.realIndicesByName = {}
         self.cursors = []
         self.code = []
         self.cursorByHandle = {}
@@ -463,7 +473,8 @@ class ExplainGrokker(object):
         self.op.births.append(table)
         return table
 
-    def _newRealTable(self, name, **kwargs):
+    def _newRealTable(self, nameAndInfo, **kwargs):
+        rootIdb, name = nameAndInfo.split('; ')
         if name in self.realTablesByName:
             table = self.realTablesByName[name]
         else:
@@ -482,17 +493,25 @@ class ExplainGrokker(object):
         return table
 
     def _parseKeyinfo(self, indexDetails):
-        keyparts = indexDetails[8:-1].split(',')
+        # see displayP4 in the source
+        # right now we just care about the first arg, nField which is the
+        # "number of key colums in the index"
+        keyparts = indexDetails[2:-1].split(',')
         numColumns = int(keyparts[0])
         return numColumns
 
-    def _newIndexOn(self, indexDetails, **kwargs):
+    def _newIndexOn(self, indexDetails, nameAndInfo, **kwargs):
         # indexDetails is of the form: "keyinfo(%d,"...
         numColumns = self._parseKeyinfo(indexDetails)
-        index = Index(columns=numColumns, openedAt=self.op,
-                      **kwargs)
-        self.indices.append(index)
-        self.op.births.append(index)
+        rootIdb, name = nameAndInfo.split('; ')
+        if name in self.realIndicesByName:
+            index = self.realIndicesByName[name]
+        else:
+            index = Index(columns=numColumns, openedAt=self.op, name=name,
+                          **kwargs)
+            self.indices.append(index)
+            self.realIndicesByName[name] = index
+            self.op.births.append(index)
         return index
 
     def _newCursor(self, handle, thing, **kwargs):
@@ -559,7 +578,7 @@ class ExplainGrokker(object):
         if isinstance(params[3], basestring):
             indexDetails = params[3]
             cursorOn = self._newIndexOn(indexDetails,
-                                        name=self.op.comment)
+                                        self.op.comment)
         else:
             cursorOn = self._newRealTable(self.op.comment,
                                           columns=params[3])
@@ -611,6 +630,25 @@ class ExplainGrokker(object):
             cursorOn = table
         self._newCursor(cursorNum, cursorOn)
 
+    def _op_SorterOpen(self, params):
+        # per docs, this is just like OpenEphemeral but it's for "large tables
+        # using an external merge-sort algorithm".
+        pass
+    def _op_SorterInsert(self, params):
+        # same as IdxInsert
+        pass
+    def _op_SorterSort(self, params):
+        # same as Sort
+        pass
+    def _op_SorterData(self, params):
+        # Its own thing
+        pass
+    def _op_SorterNext(self, params):
+        # advance read cursor to next sorted element
+        pass
+
+
+
     def _op_Permute(self, params):
         # it just prints "intarray" at least for non-debug.  not very helpful!
         pass
@@ -642,6 +680,11 @@ class ExplainGrokker(object):
     def _op_Goto(self, params):
         self._jump(params[1])
 
+    def _op_Init(self, params):
+        # says to jump to P2 if P2 is not zero
+        if (params[1]):
+            self._jump(params[1])
+
     def _op_Jump(self, params):
         # we base our decision on the result of the last compare
         self.op.regReads.append('for_jump')
@@ -656,6 +699,12 @@ class ExplainGrokker(object):
         self._jump(params[1])
         if NO_YIELDS:
             self.op.goTo.append(self.op.addr + 1)
+
+#    def _op_InitCoroutine(self, params):
+#        pass
+
+#    def _op_EndCoroutine(self, params):
+#        pass
 
     def _op_Yield(self, params):
         self.op.regReads.append(params[0])
@@ -693,13 +742,13 @@ class ExplainGrokker(object):
         if params[1]:
             self._condJump(None, params[1])
 
-    def _op_SeekLt(self, params):
+    def _op_SeekLT(self, params):
         self._op_SeekCommon(params, '<')
-    def _op_SeekLe(self, params):
+    def _op_SeekLE(self, params):
         self._op_SeekCommon(params, '<=')
-    def _op_SeekGe(self, params):
+    def _op_SeekGE(self, params):
         self._op_SeekCommon(params, '>=')
-    def _op_SeekGt(self, params):
+    def _op_SeekGT(self, params):
         self._op_SeekCommon(params, '>')
 
     def _op_IdxCommon(self, params, comparison):
@@ -709,8 +758,12 @@ class ExplainGrokker(object):
     
     def _op_IdxLT(self, params):
         self._op_IdxCommon(params, '<')
+    def _op_IdxLE(self, params):
+        self._op_IdxCommon(params, '<=')
     def _op_IdxGE(self, params):
         self._op_IdxCommon(params, '>=')
+    def _op_IdxGT(self, params):
+        self._op_IdxCommon(params, '>')
     
     def _op_IdxRowid(self, params):
         self._getCursor(params[0])
@@ -807,6 +860,20 @@ class ExplainGrokker(object):
     def _op_ResultRow(self, params):
         self.op.regReads.extend([params[0] + x for x in range(params[1])])
         self.resultRowOps.append(self.op)
+
+    def _op_AggStep(self, params):
+        # reads are taken from P2 onwards, P5 is the number of args
+        self.op.regReads.extend([params[1] + x for x in range(int(params[4]))])
+        # P3 is the accumulator so writes go there
+        self.op.regWrites = [params[2]]
+        # p4 is the function def, ex: count(1), currently ignored
+        pass
+
+    def _op_AggFinal(self, params):
+        # So although P2 is the number of args, the docs say that this function
+        # really only cares about the accumulator
+        self.op.regReads = [params[0]]
+        # P4 is the function def, ex: count(1), currently ignored
 
     def _op_Insert(self, params):
         # P4 is the table...
@@ -926,9 +993,20 @@ class ExplainGrokker(object):
 
     def _op_Null(self, params):
         self.op.regWrites.append(params[1])
+        if (params[2] > params[1]):
+            for x in xrange(params[1] + 1, params[2] + 1):
+                self.op.regWrites.append(x)
 
     def _op_Halt(self, params):
         self.op.terminate = True
+
+    def _op_AutoCommit(self, params):
+        # Used by things like BEGIN IMMEDIATE and COMMIT.  Technically this is
+        # supported to cause the VM to halt but it still seems to always be
+        # followed by a halt anyways?
+        # Leaving as a 'pass' rather than a terminate since we always see the
+        # Halt and I'd hate for there to be a fall-through nuance.
+        pass
 
     def _op_HaltIfNull(self, params):
         # halts if reg[P3] is null.
@@ -977,14 +1055,35 @@ class ExplainGrokker(object):
         # Transactions are currently boring.
         pass
 
-    def _op_Trace(self, params):
-        # Trace is used for EXPLAIN and is a no-op.
+    def _op_Explain(self, params):
+        # P4 is the EXPLAIN QUERY PLAN output for what's going on.  Clobber it
+        # to be our comment!
+        self.op.comment = params[3]
+
+    def _op_Expire(self, params):
+        # ExecuteSimpleSQL and friends use this, I think.  And so I don't think
+        # we care.
         pass
 
     def parseExplainTextFile(self, file_or_lines, schemaInfo=None):
         '''
         Process the text-formatted results of an EXPLAIN query like what would
         would get from invoking "sqlite DATABASE 'EXPLAIN ...'".
+        '''
+        # the contents aren't long enough to merit a generator
+        rows = []
+        for line in file_or_lines:
+            bits = line.split('|')
+            rows.append(bits)
+
+        self.parseExplainStringRows(rows, schemaInfo)
+
+    def parseExplainStringRows(self, rows, schemaInfo=None):
+        '''
+        Process the somewhat pre-chewed output of a sqlite EXPLAIN command.
+        In this case, we're expecting our caller to have directly driven the
+        invocation and to have chosen the delimiter and split on it for us.
+        Or maybe even directly used a python sqlite lib or something.
         '''
         self.schemaInfo = schemaInfo or SchemaGrokker()
 
@@ -1000,8 +1099,8 @@ class ExplainGrokker(object):
                 params[3] = int(params[3])
             return params
 
-        for line in file_or_lines:
-            bits = line.split('|')
+        for bits in rows:
+            print 'Parsing', bits
             addr = int(bits[0])
             opcode = bits[1]
             params = chewParams(bits[2:7])
@@ -1094,28 +1193,31 @@ class ExplainGrokker(object):
         self.basicBlocksByEnd = {}
 
         # build the blocks
+        def make_block(ops):
+            if ops:
+                block = BasicBlock(ops)
+                if VERBOSE:
+                    print 'new', block
+                self.basicBlocks[block.id] = block
+                self.basicBlocksByEnd[block.lastAddr] = block
+
         block_ops = []
         for op in self.code:
             # if we come from somewhere, then we start a new block (and create
             #  a basic block for any opcodes queued in block_ops)
             if op.comeFrom:
-                if block_ops:
-                    block = BasicBlock(block_ops)
-                    if VERBOSE:
-                        print 'new', block
-                    self.basicBlocks[block.id] = block
-                    self.basicBlocksByEnd[block.lastAddr] = block
+                make_block(block_ops)
                 block_ops = []
             block_ops.append(op)
             # if this op jumps places, then close out this set of block_ops
             #  into a basic block.
             if op.goTo or op.dynamicGoTo != False:
-                block = BasicBlock(block_ops)
-                if VERBOSE:
-                    print 'new', block
-                self.basicBlocks[block.id] = block
-                self.basicBlocksByEnd[block.lastAddr] = block
+                make_block(block_ops)
                 block_ops = []
+        
+        if block_ops:
+            make_block(block_ops)
+        
 
     def colorCursors(self):
         TANGO_COLORS = ['#73d216', '#3465a4', '#75507b', '#cc0000',
@@ -1410,6 +1512,35 @@ class VdbeStats(object):
         return self.sqlToInstances[sql][0]
 
 
+## Horrible hacky globals
+# These propagate commands from the command-line to the logic above where
+# I didn't want to have to type self a lot, apparently.  Now that we're
+# also letting ExplainGrokker be used from other modules, these need to be
+# defined here.  We're defining them to the defaults that make sense in this
+# context, but this should all be cleaned up.
+
+# Yield are dataflow analysis.  This turned out to be overkill and not really
+# useful.  Note this is a horrible hacky way to control this, but at least
+# it's hooked up to the command line mechanism!
+NO_YIELDS = True
+# No need to be chatty, especially since we don't own stdout by default
+VERBOSE = False
+DEBUG = False
+# Caller probably doesn't have stats...  This is most likely to need cleanup.
+HAVE_COUNTS = False
+
+def output_blocks(explainGrokker, sql, out_dir, filename_prefix,
+                  make_png=True):
+    block_path = os.path.join(out_dir, filename_prefix + '.dot')
+    explainGrokker.diagBasicBlocks(block_path, sql)
+
+    if make_png:
+        png_path = os.path.join(out_dir, filename_prefix + '.png')
+        subprocess.check_call(["/usr/bin/dot", "-Tpng",
+                               "-o", png_path,
+                               block_path])
+        
+
 class CmdLine(object):
     usage = '''usage: %prog [options] explained.json/explained.txt
 
@@ -1521,18 +1652,9 @@ class CmdLine(object):
                     eg.performFlow()
                     
                     if options.out_dir:
-                        blockpath = os.path.join(options.out_dir,
-                                                 '%d-blocks.dot' % (iQuery,))
-                        eg.diagBasicBlocks(blockpath, sql)
-
-                        if options.make_pngs:
-                            pngpath = os.path.join(options.out_dir,
-                                                   '%d-blocks.png' % (iQuery,))
-                            import subprocess
-                            subprocess.check_call([
-                                "/usr/bin/dot", "-Tpng",
-                                "-o", pngpath,
-                                blockpath])
+                        output_blocks(eg, sql, options.out_dir,
+                                      '%d-blocks' % (iQuery,),
+                                      make_png=options.make_pngs)
 
                     if options.out_dir and options.dataflow:
                         flowpath = os.path.join(options.out_dir,
@@ -1549,18 +1671,9 @@ class CmdLine(object):
                 basename = os.path.splitext(os.path.basename(filename))[0]
 
                 if options.out_dir:
-                    blockpath = os.path.join(options.out_dir,
-                                             '%s-blocks.dot' % (basename,))
-                    eg.diagBasicBlocks(blockpath, "...")
-
-                    if options.make_pngs:
-                        pngpath = os.path.join(options.out_dir,
-                                               '%s-blocks.png' % (basename,))
-                        import subprocess
-                        subprocess.check_call([
-                            "/usr/bin/dot", "-Tpng",
-                            "-o", pngpath,
-                            blockpath])
+                    output_blocks(eg, "...", options.out_dir,
+                                  '%s-blocks' % (basename,),
+                                  make_png=options.make_pngs)
 
                 if options.out_dir and options.dataflow:
                     flowpath = os.path.join(options.out_dir,
