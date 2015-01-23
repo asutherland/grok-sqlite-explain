@@ -60,11 +60,11 @@
 # any UIs will just consume the JSON.
 
 import calendar, time
+from collections import OrderedDict
 from datetime import datetime
 import os, os.path
 import re
-
-from collections import OrderedDict
+import subprocess
 
 import json
 import optparse
@@ -284,6 +284,13 @@ class StorageLogChewer(object):
         # all connection sessions
         self.conn_sessions = []
 
+    def filter_conn_sessions_by_path(self, filter_path):
+        filter_path = os.path.normcase(os.path.abspath(filter_path))
+        def checkit(cinfo):
+            normed = os.path.normcase(os.path.abspath(cinfo['filename']))
+            return normed == filter_path
+        return filter(checkit, self.conn_sessions)
+
     def chew(self, parseGen):
         '''
         Consume a StorageLogParser's generator, aggregating information by
@@ -410,6 +417,42 @@ class StorageLogChewer(object):
 
                 uniqueExec['execs'].append(uniqueExecInst)
 
+def run_explain(sqlite_path, db_path, sql):
+    sanitized_sql = sql.replace('\n', ' ')
+    args = [
+        sqlite_path,
+        '-separator', '<|>',
+        db_path,
+        '-cmd', 'EXPLAIN ' + sanitized_sql,
+        ]
+    pope = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, shell=False)
+    pope.stdin.close()
+    rows = []
+    for line in pope.stdout:
+        rows.append(line.rstrip().split('<|>'))
+    stderr = pope.stderr.read()
+    print 'EXPLAINED', sanitized_sql
+    print rows
+
+class ExplainProcessor(object):
+    def __init__(self, conn_sessions, out_dir, db_path, sqlite_path):
+        self.conn_sessions = conn_sessions
+        self.out_dir = out_dir
+        self.db_path = db_path
+        self.sqlite_path = sqlite_path
+
+    def processSession(self, cinfo):
+        for uexec in cinfo['uniqueExecs'].itervalues():
+            first_exec = uexec['execs'][0]
+            first_bound_sql = first_exec['boundSQL']
+            run_explain(self.sqlite_path, self.db_path, first_bound_sql)
+
+    def processAll(self):
+        for session in self.conn_sessions:
+            self.processSession(session)
+        
+
 
 class CmdLine(object):
     usage = '''usage: %prog [options] mozStorage_nspr.log
@@ -430,9 +473,21 @@ class CmdLine(object):
                                 'log; we will filter connections to this name '+
                                 'as well.'))
 
+        # This is a sucky way to handle actions, but until we have more stuff
+        # to do, it works.  If omitted we're just going to dump the structured
+        # JSON output to stdout.
+        parser.add_option('--explain',
+                          action='store_true', dest='do_explain',
+                          default=False,
+                          help='Automatically EXPLAIN unique SQL statements')
+
         parser.add_option('-o', '--output-dir',
-                          dest='out_dir', default=None,
+                          dest='out_dir', default='/tmp/explained',
                           help='Directory to output results in.')
+
+        parser.add_option('--sqlite',
+                          dest='sqlite', default=None,
+                          help='SQLite executable to use, preferably debug')
 
         return parser
     
@@ -449,11 +504,19 @@ class CmdLine(object):
             if not os.path.exists(options.out_dir):
                 os.mkdir(options.out_dir)
         
+        if options.sqlite:
+            sqlite_path = options.sqlite
+        else:
+            # How the author rolls...
+            sqlite_path = os.path.expanduser('~/bin/sqlite3')
+            if not os.path.exists(sqlite_path):
+                # How suckers roll... (system SQLite almost certainly isn't a
+                # debug build, unfortunately)
+                sqlite_path = '/usr/bin/sqlite3'
+
         db_path = options.db_path
         if db_path:
-            db_filename = os.path.basename(db_path)
-        else:
-            db_filename = None
+            db_path = os.path.abspath(db_path)
 
         for filename in args:
             parser = StorageLogParser()
@@ -461,7 +524,18 @@ class CmdLine(object):
             f = open(filename, 'rt')
             chewer.chew(parser.parse(f))
             f.close()
-            print json.dumps(chewer.conn_sessions, indent=2)
+
+            if options.db_path:
+                conn_sessions = chewer.filter_conn_sessions_by_path(db_path)
+            else:
+                conn_sessions = chewer.conn_sessions
+
+            if options.do_explain:
+                eproc = ExplainProcessor(conn_sessions, options.out_dir,
+                                         db_path, sqlite_path)
+                eproc.processAll()
+            else:
+                print json.dumps(conn_sessions, indent=2)
             
 
 if __name__ == '__main__':
