@@ -133,9 +133,9 @@ def unwrap_nspr_log_lines(lineGen):
 
 
 # Opening connection to 'places.sqlite' (7f39931861a0)
-RE_OPEN = re.compile("^Opening connection to '(.+)' \(0x([0-9a-fA-F]+)\)$")
+RE_OPEN = re.compile("^Opening connection to '(.+)' \((?:0x)?([0-9a-fA-F]+)\)$")
 # Closing connection to 'cookies.sqlite'
-RE_CLOSE = re.compile("^Closing connection to '(.+)' \(0x([0-9a-fA-F]+)\)$")
+RE_CLOSE = re.compile("^Closing connection to '(.+)' \((?:0x)?([0-9a-fA-F]+)\)$")
 # Initialized statement 'SOME SQL WITH PARAMETER PLACEHOLDERS' (0x7f398ea28b20)
 # NOTE! the pointer is the statement pointer, not the connection id!
 RE_INIT = re.compile("^(Initialized|Inited async) statement '(.+)' \(conn 0x([0-9a-fA-F]+) stmt 0x([0-9a-fA-F]+)\)$",
@@ -163,6 +163,13 @@ RE_FINALIZE = re.compile(
 RE_NATIVE_ASYNC = re.compile(
   "^Native async statement \(conn 0x([0-9a-fA-F]+) stmt 0x([0-9a-fA-F]+)\)" +
   " initialized '(.+)' as 0x([0-9a-fA-F]+)$",
+  re.DOTALL)
+
+RE_TRACE_STMT = re.compile(
+  "^TRACE_STMT on ([0-9a-fA-F]+): '(.+)'$",
+  re.DOTALL)
+RE_TRACE_TIME = re.compile(
+  "^TRACE_TIME on ([0-9a-fA-F]+): (.+)ms$",
   re.DOTALL)
 
 # !!! I haven't implemented parsing for these yet (not seeing them in usage):
@@ -224,6 +231,7 @@ class StorageLogParser(object):
                     d['conn'] = m.group(1)
                     d['stmt'] = m.group(2)
                     d['native'] = m.group(4)
+            # Think this is now TRACE_STMT, XXX remove
             elif firstWord == 'sqlite3_trace':
                 m = RE_EXEC.match(msg)
                 if not m:
@@ -234,6 +242,7 @@ class StorageLogParser(object):
                     d['type'] = 'exec'
                     d['sql'] = m.group(2)
                     d['conn'] = m.group(1)
+            # Think this is now TRACE_TIME, XXX remove
             elif firstWord == 'sqlite3_profile':
                 m = RE_PROFILE.match(msg)
                 if not m:
@@ -268,6 +277,26 @@ class StorageLogParser(object):
                     d['stmt'] = m.group(5)
                     d['sql'] = m.group(2)
                     d['gc'] = m.group(3) and True or False
+            elif firstWord == 'TRACE_STMT':
+                m = RE_TRACE_STMT.match(msg)
+                if not m:
+                    d['type'] = 'bad'
+                    if VERBOSE:
+                        print 'Sad TRACE_STMT msg:', repr(msg)
+                else:
+                    d['type'] = 'exec'
+                    d['conn'] = m.group(1)
+                    d['sql'] = m.group(2)
+            elif firstWord == 'TRACE_TIME':
+                m = RE_TRACE_STMT.match(msg)
+                if not m:
+                    d['type'] = 'bad'
+                    if VERBOSE:
+                        print 'Sad TRACE_TIME msg:', repr(msg)
+                else:
+                    d['type'] = 'profile'
+                    d['conn'] = m.group(1)
+                    d['durationMS'] = float(m.group(2))
             else:
                 d['type'] = 'unknown'
                 if VERBOSE:
