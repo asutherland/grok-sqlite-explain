@@ -8,7 +8,7 @@
 # An example command line to produce such a log would be to have the following
 # environment variables set when running firefox, such as by pasting this at
 # the front of a shell command line:
-# NSPR_LOG_MODULES=mozStorage:5,timestamp NSPR_LOG_FILE=/tmp/mozStorage.log 
+# NSPR_LOG_MODULES=mozStorage:5,timestamp NSPR_LOG_FILE=/tmp/mozStorage.log
 #
 # Core goals:
 # - Be able to filter results to connections based on filename.  (We don't have
@@ -19,7 +19,7 @@
 # - Be able to produce some profilish-ish performance statistics from the logs
 #
 # ## Implementation Overview ##
-# 
+#
 # Log lines are parsed into a simple normalized dictionary-style representation
 # from their human readable form.  Higher level processing is then done on
 # those, but always keeping thost dicts around.
@@ -47,8 +47,8 @@
 #   { sql, conn, stmt } where sql has the parameter placeholders
 #   intact.
 # - finalize: statement finalized. { sql, gc, conn, stmt }
-# 
-# 
+#
+#
 # ## Meta ##
 # This script is written in python because I had some existing log parsing logic
 # from my Thunderbird days available and because both grokexplain.py (from this
@@ -121,10 +121,15 @@ def unwrap_nspr_log_lines(lineGen):
                 print 'Line with bad thread id:', line
             continue
         tid = line[idxThreadStart+1:idxThreadEnd]
-        
-        msg = line[idxThreadEnd+3:]
 
-        yield ts, tid, msg
+        # +3 gets us to the "D/whatever", +5 gets us to the "whatever"
+        level = line[idxThreadEnd+3:idxThreadEnd+4]
+        idxModuleSpace = line.find(' ', idxThreadEnd+5)
+        module = line[idxThreadEnd+5:idxModuleSpace]
+        msg = line[idxModuleSpace+1:].rstrip()
+
+        #print repr((ts, tid, level, module, msg))
+        yield ts, tid, level, module, msg
 
 
 # Opening connection to 'places.sqlite' (7f39931861a0)
@@ -170,7 +175,7 @@ class StorageLogParser(object):
     Generator style low-level parser.
     '''
     def parse(self, f):
-        for ts, tid, msg in unwrap_nspr_log_lines(coalesce_indented_lines(f)):
+        for ts, tid, level, module, msg in unwrap_nspr_log_lines(coalesce_indented_lines(f)):
             firstWord = msg[:msg.find(' ')]
             d = OrderedDict()
             d['ts'] = ts
@@ -354,7 +359,7 @@ class StorageLogChewer(object):
             else:
                 connId = None
                 cinfo = None
-            
+
             if dtype == 'open':
                 # Nothing interesting to do for open since we're already
                 # implicitly doing everything.
@@ -393,7 +398,7 @@ class StorageLogChewer(object):
                     if PARANOIA:
                         print 'profile without active', d
                     continue
-                
+
                 # update the exec with info on this
                 execs = cinfo['execs']
                 execInfo = OrderedDict()
@@ -453,14 +458,14 @@ def run_explain(sqlite_path, db_path, sql):
 
 class ExplainProcessor(object):
     '''
-    Process connection sessions to generate 
+    Process connection sessions to generate
     '''
     def __init__(self, conn_sessions, out_dir, db_path, sqlite_path):
         self.conn_sessions = conn_sessions
         self.out_dir = out_dir
         self.db_path = db_path
         self.sqlite_path = sqlite_path
-        
+
         self.next_id = 1
         self.explanations = []
         self.already_explained = set()
@@ -492,7 +497,7 @@ class ExplainProcessor(object):
             eg.performFlow()
 
             # it's possible this was a super-boring thing, in which case we
-            # 
+            #
 
             filename_prefix = 'blocks-%d' % (use_id,)
             grokexplain.output_blocks(eg, first_bound_sql, self.out_dir,
@@ -550,7 +555,7 @@ class CmdLine(object):
                           help='SQLite executable to use, preferably debug')
 
         return parser
-    
+
     def run(self):
         global VERBOSE
 
@@ -563,7 +568,7 @@ class CmdLine(object):
         if options.out_dir:
             if not os.path.exists(options.out_dir):
                 os.mkdir(options.out_dir)
-        
+
         if options.sqlite:
             sqlite_path = options.sqlite
         else:
@@ -600,7 +605,7 @@ class CmdLine(object):
                 explained_file.close()
             else:
                 print json.dumps(conn_sessions, indent=2)
-            
+
 
 if __name__ == '__main__':
     cmdline = CmdLine()
